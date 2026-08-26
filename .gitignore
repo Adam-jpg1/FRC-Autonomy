@@ -15,11 +15,12 @@ venv/
 logs/
 !logs/.gitkeep
 
-# Trained weights and exports (large binaries, rebuilt per season)
+# Model artifacts (large binaries, rebuilt per season)
 models/*.pt
-models/*.engine
 models/*.onnx
 models/*.torchscript
+models/*_hailo_model/
+models/*.hef
 
 # Downloaded / generated data
 data/field_layout.json

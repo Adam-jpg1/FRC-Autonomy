@@ -12,7 +12,7 @@ from frc_perception.world_model import WorldModel, fit_velocity, merge_observati
 
 def fuel_observation(x, y, timestamp=0.0, camera="cam0", confidence=0.9, quality=1.0):
     return FieldObservation(
-        camera_name=camera,
+        camera_id=camera,
         timestamp=timestamp,
         class_name=CLASS_FUEL,
         role=ObjectRole.GAME_PIECE,
@@ -26,7 +26,7 @@ def fuel_observation(x, y, timestamp=0.0, camera="cam0", confidence=0.9, quality
 
 def robot_observation(x, y, timestamp=0.0, camera="cam0", role=ObjectRole.OPPONENT):
     return FieldObservation(
-        camera_name=camera,
+        camera_id=camera,
         timestamp=timestamp,
         class_name=CLASS_BUMPER_RED,
         role=role,
@@ -55,7 +55,7 @@ def test_two_cameras_seeing_one_ball_produce_one_observation():
     )
     assert len(merged) == 1
     assert merged[0].merged_count == 2
-    assert "cam0" in merged[0].camera_name and "cam1" in merged[0].camera_name
+    assert "cam0" in merged[0].camera_id and "cam1" in merged[0].camera_id
     assert 4.0 <= merged[0].x_field_m <= 4.15
 
 

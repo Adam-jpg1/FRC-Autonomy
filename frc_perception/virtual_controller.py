@@ -1,6 +1,6 @@
 """Virtual gamepad adapter: desired motion -> controller axes.
 
-The Jetson can publish a synthetic gamepad to NetworkTables so the
+The Pi can publish a synthetic gamepad to NetworkTables so the
 roboRIO can drive from it exactly as it drives from a real one.  That is
 a powerful and dangerous capability, so this module is built around three
 rules:
@@ -11,9 +11,9 @@ rules:
    False, POV -1.
 2. **Everything is published every cycle.** The roboRIO never has to
    remember or infer a value that was left out.
-3. **The Jetson is not the safety gate.** A heartbeat counter is
-   published unconditionally so the RIO can detect a dead or wedged
-   Jetson.  The RIO must require, at minimum: ``enabled == true`` AND an
+3. **The coprocessor is not the safety gate.** A heartbeat counter is
+   published unconditionally so the RIO can detect a dead or wedged Pi.
+   The RIO must require, at minimum: ``enabled == true`` AND an
    advancing heartbeat AND its own deadman held AND a robot mode that
    permits automation.  See the README.
 
@@ -72,14 +72,14 @@ def mechanism_policy(
 ) -> MechanismCommand:
     """Decide mechanism intents (intake, shoot, ...) for this cycle.
 
-    SHIPPED NEUTRAL ON PURPOSE.  Actuating a mechanism from the Jetson is
+    SHIPPED NEUTRAL ON PURPOSE.  Actuating a mechanism from the Pi is
     a robot-specific decision that depends on hardware this code has never
     seen, and a wrong guess here fires a shooter in the pit.
 
     # MUST INPUT: your robot's mechanism logic and the button bindings it
     # maps onto. Implement the intents below (or add your own) and then
     # wire them to buttons in `controller_state_from_motion`. Until you do,
-    # every mechanism button stays False and the Jetson only ever suggests
+    # every mechanism button stays False and the Pi only ever suggests
     # driving.
 
     The arguments are the information a real policy would need; they are
@@ -142,7 +142,7 @@ class VirtualController:
         """Produce the gamepad state for this cycle.
 
         The heartbeat advances on EVERY call, enabled or not, so the RIO
-        can distinguish "Jetson says do nothing" from "Jetson is gone".
+        can distinguish "the Pi says do nothing" from "the Pi is gone".
         """
         self._heartbeat += 1
         dt = 0.0 if self._last_update is None else max(0.0, now - self._last_update)
@@ -151,7 +151,7 @@ class VirtualController:
         if self._logged_enabled != self.cfg.enabled:
             if self.cfg.enabled:
                 logger.warning(
-                    "VIRTUAL CONTROLLER ENABLED -- the Jetson is publishing live stick "
+                    "VIRTUAL CONTROLLER ENABLED -- the Pi is publishing live stick "
                     "commands; the roboRIO deadman is the only remaining gate"
                 )
             else:

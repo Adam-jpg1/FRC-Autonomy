@@ -17,17 +17,25 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import platform
+import shutil
+import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
 # Make the package importable when run from a checkout without installing.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from frc_perception.camera import list_video_devices  # noqa: E402
 from frc_perception.config import (  # noqa: E402
     AppConfig,
     config_summary,
     load_config,
     validate_config,
+)
+from frc_perception.detector import (  # noqa: E402
+    HailoDetectorBackend,
+    compare_class_names,
 )
 
 PASS = "PASS"
@@ -68,9 +76,10 @@ class CheckReport:
 #: (module, why we need it, fatal if missing)
 _REQUIRED_IMPORTS = (
     ("numpy", "all geometry and fusion math", True),
-    ("cv2", "camera capture, calibration, image handling", True),
-    ("ultralytics", "YOLO object detection", False),
-    ("torch", "YOLO backend; on the Jetson this must be NVIDIA's CUDA build", False),
+    ("cv2", "USB camera capture, calibration, image handling", True),
+    ("yaml", "reading the Hailo export metadata (class names)", True),
+    ("ultralytics", "loading the model and running inference", False),
+    ("hailo_platform", "HailoRT: talking to the Hailo-8 on the AI HAT+", False),
     ("pupil_apriltags", "AprilTag detection for absolute localization", False),
     ("ntcore", "NetworkTables 4 client (pip package: pyntcore)", False),
 )
@@ -100,22 +109,119 @@ def check_imports(report: CheckReport) -> Dict[str, bool]:
                 f"import.{module}",
                 f"unavailable: {exc} -- needed for {why}",
             )
-    if available.get("torch"):
-        try:
-            import torch
+    return available
 
-            if torch.cuda.is_available():
-                report.add(PASS, "torch.cuda", torch.cuda.get_device_name(0))
+
+def read_model_name() -> str:
+    """Raspberry Pi models publish their name in the device tree."""
+    for path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+        try:
+            with open(path, "rb") as handle:
+                return handle.read().decode("utf-8", "replace").strip("\x00\n ")
+        except OSError:
+            continue
+    return ""
+
+
+def check_platform(cfg: AppConfig, report: CheckReport) -> bool:
+    """Identify the machine.  Returns True if it looks like the target Pi."""
+    machine = platform.machine()
+    bits = platform.architecture()[0]
+    model = read_model_name()
+
+    report.add(PASS, "platform.configured", cfg.platform)
+    report.add(PASS, "platform.arch", f"{machine} {bits} ({platform.system()})")
+
+    if model:
+        report.add(PASS, "platform.model", model)
+    is_pi = "raspberry pi" in model.lower()
+    is_pi5 = is_pi and " 5" in model
+
+    if cfg.platform == "raspberry_pi_5":
+        if not is_pi:
+            report.add(
+                WARN, "platform.model",
+                f"config targets raspberry_pi_5 but this machine reports "
+                f"{model or 'no device-tree model'}. Fine on a development "
+                "computer; the Hailo checks below will be skipped or warn.",
+            )
+        elif not is_pi5:
+            report.add(WARN, "platform.model", f"Raspberry Pi detected, but not a Pi 5: {model}")
+        if is_pi and machine not in ("aarch64", "arm64"):
+            report.add(
+                FAIL, "platform.arch",
+                f"Raspberry Pi running a {machine} userland. HailoRT and the "
+                "Ultralytics wheels need 64-bit Raspberry Pi OS (aarch64).",
+            )
+        if bits != "64bit":
+            report.add(FAIL, "platform.arch", f"{bits} Python; 64-bit is required")
+    return is_pi
+
+
+def check_hailo(cfg: AppConfig, report: CheckReport, have_hailort: bool, on_pi: bool) -> None:
+    """Runtime + device + artifact checks for the Hailo-8 accelerator."""
+    if cfg.detector.backend != "hailo":
+        report.add(
+            WARN, "hailo.backend",
+            f"detector backend is {cfg.detector.backend!r}, so the Hailo is not in use. "
+            "That is correct for development and WRONG for competition.",
+        )
+    # -- runtime --------------------------------------------------------
+    if have_hailort:
+        report.add(PASS, "hailo.runtime", "hailo_platform (HailoRT) importable")
+    else:
+        report.add(
+            FAIL if on_pi else WARN, "hailo.runtime",
+            "hailo_platform not importable. On Raspberry Pi OS: "
+            "`sudo apt install hailo-all` then reboot. "
+            "(Expected to be absent on a development computer.)",
+        )
+
+    # -- device ----------------------------------------------------------
+    identify = shutil.which("hailortcli")
+    if identify:
+        try:
+            completed = subprocess.run(
+                [identify, "fw-control", "identify"],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if completed.returncode == 0:
+                summary = " | ".join(
+                    line.strip()
+                    for line in completed.stdout.splitlines()
+                    if any(k in line for k in ("Device Architecture", "Serial", "Part Number"))
+                )
+                report.add(PASS, "hailo.device", summary or "accelerator responded")
             else:
                 report.add(
-                    WARN,
-                    "torch.cuda",
-                    "no CUDA device; YOLO will run on CPU. On the Jetson, install "
-                    "NVIDIA's torch wheel (see requirements.txt).",
+                    FAIL if on_pi else WARN, "hailo.device",
+                    f"`hailortcli fw-control identify` failed: "
+                    f"{(completed.stderr or completed.stdout).strip()[:160]}",
                 )
-        except Exception as exc:  # noqa: BLE001
-            report.add(WARN, "torch.cuda", f"probe failed: {exc}")
-    return available
+        except (OSError, subprocess.SubprocessError) as exc:
+            report.add(WARN, "hailo.device", f"could not run hailortcli: {exc}")
+    else:
+        report.add(
+            FAIL if on_pi else WARN, "hailo.device",
+            "hailortcli not on PATH; cannot confirm the accelerator. "
+            "Install hailo-all and reboot.",
+        )
+
+    # -- artifact (works with no hardware at all) -------------------------
+    backend = HailoDetectorBackend(cfg.detector)
+    ok, messages = backend.preflight()
+    detail = "; ".join(messages) if messages else "no detail"
+    if ok:
+        report.add(PASS, "hailo.model", detail)
+    elif not os.path.exists(cfg.detector.hailo_model_path):
+        report.add(
+            MUST, "hailo.model",
+            f"{cfg.detector.hailo_model_path} not found. Compile it on an x86_64 "
+            "Linux machine with training/export_hailo.py and copy the whole "
+            "directory here -- the Pi cannot compile a HEF.",
+        )
+    else:
+        report.add(FAIL, "hailo.model", detail)
 
 
 def check_config(cfg: AppConfig, report: CheckReport) -> None:
@@ -128,31 +234,32 @@ def check_config(cfg: AppConfig, report: CheckReport) -> None:
         report.add(status, f"config.{issue.where}", issue.message)
 
 
-def check_model(cfg: AppConfig, report: CheckReport, have_ultralytics: bool) -> None:
-    path = cfg.detector.model_path
+def check_pytorch_model(cfg: AppConfig, report: CheckReport, have_ultralytics: bool) -> None:
+    """Check the .pt artifact -- the development backend and the export source."""
+    path = cfg.detector.pytorch_model_path
+    required = cfg.detector.backend == "pytorch"
     if not os.path.exists(path):
         report.add(
-            MUST,
-            "model.file",
-            f"{path} not found -- train one with training/ and copy best.pt here",
+            MUST if required else WARN,
+            "model.pytorch",
+            f"{path} not found. It is the TRAINING output and the source for the "
+            "Hailo export; it is not needed at runtime when backend='hailo'.",
         )
         return
     size_mb = os.path.getsize(path) / 1e6
-    report.add(PASS, "model.file", f"{path} ({size_mb:.1f} MB)")
+    report.add(PASS, "model.pytorch", f"{path} ({size_mb:.1f} MB)")
     if not have_ultralytics:
         report.add(WARN, "model.classes", "cannot inspect classes: ultralytics missing")
         return
     try:
         from ultralytics import YOLO
 
-        from frc_perception.detector import compare_class_names
-
         model = YOLO(path)
         names = {int(k): str(v) for k, v in dict(getattr(model, "names", {})).items()}
         ok, message = compare_class_names(names, cfg.detector.class_names)
         report.add(PASS if ok else FAIL, "model.classes", message)
     except Exception as exc:  # noqa: BLE001
-        report.add(FAIL, "model.classes", f"could not load weights: {exc}")
+        report.add(WARN, "model.classes", f"could not load weights: {exc}")
 
 
 def check_field_layout(cfg: AppConfig, report: CheckReport) -> None:
@@ -195,6 +302,41 @@ def check_calibration(cfg: AppConfig, report: CheckReport) -> None:
                 f"calibration.{cam.name}",
                 "not calibrated -- run scripts/calibrate_intrinsics.py "
                 f"--camera {cam.name}",
+            )
+
+
+def check_camera_paths(cfg: AppConfig, report: CheckReport) -> None:
+    """Report the persistent device paths available on this machine."""
+    devices = list_video_devices()
+    by_id = [d for d in devices if d["kind"] == "by-id"]
+    if devices:
+        report.add(
+            PASS, "camera.devices",
+            f"{len(by_id)} by-id path(s): "
+            + ", ".join(f"{os.path.basename(d['path'])} -> {d['node']}" for d in by_id[:4]),
+        )
+    else:
+        report.add(
+            WARN, "camera.devices",
+            "no /dev/v4l/by-id entries (normal on a development computer; on the "
+            "Pi it means no USB camera is attached)",
+        )
+
+    for cam in cfg.cameras:
+        if not cam.enabled:
+            continue
+        if cam.uses_persistent_path:
+            exists = os.path.exists(cam.device_path)
+            report.add(
+                PASS if exists else FAIL,
+                f"camera.{cam.name}.path",
+                f"{cam.device_path}" + ("" if exists else " does not exist"),
+            )
+        else:
+            report.add(
+                MUST, f"camera.{cam.name}.path",
+                f"using /dev/video{cam.device_index} with no persistent path; "
+                "set device_path from `ls -l /dev/v4l/by-id/`",
             )
 
 
@@ -257,7 +399,7 @@ def check_controller_safety(cfg: AppConfig, report: CheckReport) -> None:
         report.add(
             WARN,
             "controller.enabled",
-            "VIRTUAL CONTROLLER IS ENABLED. The Jetson will publish live stick "
+            "VIRTUAL CONTROLLER IS ENABLED. The Pi will publish live stick "
             "commands; confirm the roboRIO deadman gate before powering the drivetrain.",
         )
     else:
@@ -288,17 +430,20 @@ def scan_must_input(root: str) -> List[Tuple[str, int, str]]:
 
 def run_check(cfg: AppConfig, root: str, probe_cameras: bool = True) -> int:
     print("=" * 78)
-    print("FRC 2026 Jetson perception -- preflight check")
+    print("FRC 2026 perception -- preflight check (Raspberry Pi 5 + Hailo-8)")
     print("=" * 78)
     print(config_summary(cfg))
 
     report = CheckReport()
     check_python(report)
+    on_pi = check_platform(cfg, report)
     available = check_imports(report)
     check_config(cfg, report)
-    check_model(cfg, report, available.get("ultralytics", False))
+    check_hailo(cfg, report, available.get("hailo_platform", False), on_pi)
+    check_pytorch_model(cfg, report, available.get("ultralytics", False))
     check_field_layout(cfg, report)
     check_calibration(cfg, report)
+    check_camera_paths(cfg, report)
     if probe_cameras:
         check_cameras(cfg, report, available.get("cv2", False))
     else:
@@ -368,11 +513,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         metavar="NAME=PATH",
         help="serve a camera from a video file or image directory instead of hardware",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("hailo", "pytorch"),
+        help="override the detector backend for this run (pytorch is DEVELOPMENT only)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
     root = os.path.dirname(os.path.abspath(__file__))
     cfg = load_config()
+    if args.backend:
+        cfg.detector.backend = args.backend
 
     if args.check:
         return run_check(cfg, root, probe_cameras=not args.no_camera_probe)

@@ -9,8 +9,13 @@ Runtime data files. Most of these are generated or downloaded, and are
 | `calibration/<camera>.json` | camera intrinsics | `python scripts/calibrate_intrinsics.py --camera <name> --square-size <m>` |
 | `distance/<camera>.csv` | raw/true distance pairs | `python scripts/calibrate_distance.py --camera <name> --collect` |
 | `snapshots/` | frames saved from `camera_preview.py` | press `s` in the preview window |
-| `samples/` | still images for hardware-free testing | put your own here |
+| `samples/` | still images for hardware-free testing and benchmarking | put your own here |
 | `clips/` | recorded video for hardware-free testing | put your own here |
+
+`data/samples/` doubles as the input for `scripts/benchmark_detector.py`
+and `scripts/test_hailo.py`. Use real field images at the resolution the
+cameras actually run — benchmarking on unrepresentative images gives an
+unrepresentative number.
 
 ## The field layout
 
@@ -50,4 +55,7 @@ under version control.
 ```bash
 python run.py --sim-nt --replay cam0=data/clips/practice.mp4
 python run.py --sim-nt --replay cam0=data/samples/
+
+# development detector backend (PyTorch .pt), no accelerator needed
+python run.py --backend pytorch --sim-nt --replay cam0=data/clips/practice.mp4
 ```

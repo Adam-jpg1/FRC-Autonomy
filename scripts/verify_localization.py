@@ -5,6 +5,10 @@
     python scripts/verify_localization.py --camera cam0 --window
     python scripts/verify_localization.py --sim-nt        # plumbing check, no RIO
 
+Unchanged by the Raspberry Pi migration: AprilTag detection, camera
+calibration, tag solving and pose fusion all run on the CPU exactly as
+before. Only object detection moved to the Hailo-8.
+
 WHAT THIS IS FOR
 ----------------
 Every convention in this project -- +X down field, +Y left, CCW-positive
@@ -194,7 +198,7 @@ def main() -> int:
                 for name, frame in frames.items():
                     display = frame.image.copy()
                     for observation in observations:
-                        if observation.camera_name != name:
+                        if observation.camera_id != name:
                             continue
                         cv2.putText(
                             display,

@@ -15,12 +15,14 @@ from frc_perception.config import (
     load_config,
     validate_config,
 )
-from frc_perception.detector import compare_class_names, resolve_device
+from frc_perception.detector import compare_class_names, resolve_torch_device
 
 
 def calibrated_camera(name="cam0", index=0) -> CameraConfig:
     return CameraConfig(
-        name=name, device_index=index,
+        name=name,
+        device_index=index,
+        device_path=f"/dev/v4l/by-id/usb-Arducam-{name}-video-index0",
         fx=800.0, fy=805.0, cx=640.0, cy=400.0,
         mount_x_m=0.3, mount_y_m=0.0, mount_z_m=0.6,
         pitch_deg=18.0, yaw_deg=0.0, roll_deg=0.0,
@@ -79,7 +81,7 @@ def test_duplicate_camera_names_fail():
 
 def test_two_cameras_on_one_device_fail():
     cfg = complete_config()
-    cfg.cameras[1].device_index = cfg.cameras[0].device_index
+    cfg.cameras[1].device_path = cfg.cameras[0].device_path
     assert "FAIL" in severities(cfg)
 
 
@@ -214,6 +216,7 @@ def test_an_extra_class_is_reported():
     assert not ok and "unexpected" in message
 
 
-def test_explicit_device_requests_are_passed_through():
-    assert resolve_device("cpu") == "cpu"
-    assert resolve_device("cuda:1") == "cuda:1"
+def test_explicit_torch_device_requests_are_passed_through():
+    """Development backend only -- production inference is on the Hailo-8."""
+    assert resolve_torch_device("cpu") == "cpu"
+    assert resolve_torch_device("mps") == "mps"

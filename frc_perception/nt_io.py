@@ -82,8 +82,18 @@ def build_perception_payload(
     pose_valid: bool,
     pose_invalid_reason: str,
     frame_counter: int,
-    camera_health: Sequence[Tuple[bool, float]],
+    camera_health: Sequence[Tuple[bool, float, float, int]],
     model_loaded: bool,
+    detector_healthy: bool,
+    detector_backend: str,
+    detector_classes_ok: bool,
+    detector_error: str,
+    detector_latency_ms: float,
+    preprocess_ms: float,
+    postprocess_ms: float,
+    frames_skipped: int,
+    stale_frames_dropped: int,
+    stale_results_dropped: int,
     odometry_fresh: bool,
     tag_pose_available: bool,
     tag_count: int,
@@ -110,7 +120,14 @@ def build_perception_payload(
     and testable without a NetworkTables server.  The required keys from
     the system contract are listed first; the rest are diagnostics.
     ``camera_health`` is indexed by position in ``config.cameras``, which
-    is what ``camera_0_*`` / ``camera_1_*`` refer to.
+    is what ``camera_0_*`` / ``camera_1_*`` refer to.  Each entry is
+    ``(healthy, capture_fps, inference_fps, frames_skipped)``: capture rate
+    and inference rate are separate numbers because with one accelerator
+    and two cameras they are expected to differ.
+
+    The required contract keys below are identical to the ones the
+    roboRIO already consumes.  The interface does not care which
+    coprocessor or accelerator produced them.
     """
     payload: Dict[str, Any] = {
         # -- required contract keys ----------------------------------------
@@ -143,6 +160,16 @@ def build_perception_payload(
         "perception_latency_ms": float(perception_latency_ms),
         "inference_ms": float(inference_ms),
         "apriltag_ms": float(apriltag_ms),
+        "detector_healthy": bool(detector_healthy),
+        "detector_backend": detector_backend,
+        "detector_classes_ok": bool(detector_classes_ok),
+        "detector_error": detector_error,
+        "detector_latency_ms": float(detector_latency_ms),
+        "preprocess_ms": float(preprocess_ms),
+        "postprocess_ms": float(postprocess_ms),
+        "frames_skipped": int(frames_skipped),
+        "stale_frames_dropped": int(stale_frames_dropped),
+        "stale_results_dropped": int(stale_results_dropped),
         "nav_reason": nav_reason,
         "nav_vx_mps": float(nav_vx),
         "nav_vy_mps": float(nav_vy),
@@ -152,9 +179,12 @@ def build_perception_payload(
         "nav_has_target": bool(nav_has_target),
         "virtual_controller_enabled": bool(virtual_controller_enabled),
     }
-    for index, (healthy, fps) in enumerate(camera_health):
+    for index, entry in enumerate(camera_health):
+        healthy, capture_fps, inference_fps, skipped = entry
         payload[f"camera_{index}_healthy"] = bool(healthy)
-        payload[f"camera_{index}_fps"] = float(fps)
+        payload[f"camera_{index}_fps"] = float(capture_fps)
+        payload[f"camera_{index}_inference_fps"] = float(inference_fps)
+        payload[f"camera_{index}_frames_skipped"] = int(skipped)
     return payload
 
 

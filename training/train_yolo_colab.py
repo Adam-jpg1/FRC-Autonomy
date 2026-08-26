@@ -24,9 +24,11 @@ takes hours instead of minutes; the script says which one you are on.
 
 THE OUTPUT
 ----------
-``best.pt`` is what the Jetson loads. It must contain exactly the classes
-``fuel``, ``bumper_blue``, ``bumper_red`` -- :func:`verify_model_classes`
-checks that before you waste a trip to the robot.
+``best.pt`` is the TRAINING output. It is then compiled for the Hailo-8
+on an x86_64 Linux machine (``training/export_hailo.py``) -- the Raspberry
+Pi never compiles a model. It must contain exactly the classes ``fuel``,
+``bumper_blue``, ``bumper_red`` -- :func:`verify_model_classes` checks that
+before you waste a trip to the robot.
 """
 
 from __future__ import annotations
@@ -55,7 +57,11 @@ DEFAULT_RUN_NAME = "frc2026"
 
 
 def install_ultralytics(version: str = "") -> None:
-    """Install Ultralytics. Colab already has torch with CUDA, so leave it alone."""
+    """Install Ultralytics.
+
+    Colab already provides a GPU-enabled torch; leave it alone. This is the
+    TRAINING machine -- the robot runs on a Hailo-8 and needs none of it.
+    """
     package = f"ultralytics=={version}" if version else "ultralytics"
     print(f"installing {package} ...")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", package], check=True)
@@ -397,10 +403,12 @@ def train(
 ):
     """Train and return the Ultralytics results object.
 
-    ``yolov8n`` is the right starting point for an Orin Nano: it is the
-    one that comfortably runs two camera streams in real time. Move up to
-    ``yolov8s`` only after you have measured FPS on the actual Jetson and
-    found headroom.
+    ``yolov8n`` is the right starting point. Move up to ``yolov8s`` only
+    after you have MEASURED FPS on the actual Raspberry Pi 5 + Hailo-8
+    with ``scripts/benchmark_detector.py`` and found headroom.
+
+    Ultralytics' Hailo export supports YOLOv8, YOLO11 and YOLO26 detection
+    models; anything else will not compile for the accelerator.
 
     The augmentation defaults below are chosen for FRC:
     * ``fliplr`` is ON -- the field is symmetric and a mirrored ball is
@@ -539,7 +547,7 @@ def show_training_plots(run_dir: str) -> None:
 def verify_model_classes(weights: str) -> bool:
     """The check that saves a wasted trip to the robot.
 
-    The Jetson routes detections by class NAME. Weights whose names do not
+    The runtime routes detections by class NAME. Weights whose names do not
     match are not "mostly fine" -- the mismatched classes are silently
     dropped at runtime.
     """
@@ -552,7 +560,7 @@ def verify_model_classes(weights: str) -> bool:
     if actual == expected:
         print("OK: classes match the runtime contract exactly")
         return True
-    print("MISMATCH -- this model is NOT compatible with the Jetson code:")
+    print("MISMATCH -- this model is NOT compatible with the runtime:")
     if expected - actual:
         print(f"  missing   : {sorted(expected - actual)}")
     if actual - expected:
@@ -637,10 +645,13 @@ def export_best(
             print("not in Colab; skipping browser download")
 
     print(
-        "\nOn the Jetson:\n"
-        "  1. copy best.pt into  models/best.pt\n"
-        "  2. python scripts/test_yolo_image.py --model models/best.pt --image <a photo>\n"
-        "  3. python run.py --check      (confirms the class names match)"
+        "\nNEXT: compile for the Hailo-8 on an x86_64 LINUX machine\n"
+        "  (the Raspberry Pi cannot compile a HEF):\n"
+        "  1. copy best.pt to that machine, into  models/best.pt\n"
+        "  2. python training/export_hailo.py --model models/best.pt --arch hailo8\n"
+        "  3. copy the WHOLE best_hailo_model/ directory to the Pi\n"
+        "  4. python scripts/test_hailo.py --model models/best_hailo_model --image <a photo>\n"
+        "  5. python run.py --check      (confirms the class names match)"
     )
     return destination
 

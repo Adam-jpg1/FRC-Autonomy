@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "frc-jetson-perception"
+name = "frc-perception"
 version = "1.0.0"
-description = "FRC 2026 Jetson perception, localization, world model and navigation assistance"
+description = "FRC 2026 Raspberry Pi 5 + Hailo-8 perception, localization, world model and navigation assistance"
 requires-python = ">=3.8"
 dependencies = [
     "numpy>=1.23",

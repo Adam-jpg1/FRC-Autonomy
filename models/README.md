@@ -1,45 +1,61 @@
 # `models/`
 
-Trained YOLO weights live here. **They are not committed to git** (see
-`.gitignore`) — they are large binaries that change often.
+Model artifacts. **Not committed to git** (see `.gitignore`) — they are
+large binaries that change often.
 
-| file | what it is |
-|---|---|
-| `best.pt` | the weights the runtime loads (`config.detector.model_path`) |
-| `best.engine` | optional TensorRT engine, built **on the Jetson** |
-| `best.onnx` | optional intermediate export |
+| path | what it is | needed at runtime? |
+|---|---|---|
+| `best_hailo_model/` | the deployed Hailo-8 artifact **directory** | **yes**, on the Pi |
+| `best_hailo_model/best.hef` | the compiled network | yes |
+| `best_hailo_model/metadata.yaml` | class names, imgsz, `hailo_arch` | **yes — this is where class names come from** |
+| `best_hailo_model/nms_config.json` | on-chip NMS parameters baked at export | yes |
+| `best.pt` | trained PyTorch weights | no — training output and export source |
 
-## Installing a model
+## The directory is the artifact
 
 ```bash
-# copy the file trained in Colab
-cp ~/Downloads/best.pt models/best.pt
-
-# verify it has exactly the three expected classes
-python scripts/test_yolo_image.py --model models/best.pt --image <a real photo>
-python run.py --check
+rsync -av best_hailo_model/ pi@<robot-pi>:~/FRC/models/best_hailo_model/
 ```
 
-The weights **must** contain exactly these class names:
+Copying **only the `.hef`** is the most likely deployment mistake. Ultralytics
+reads class names from the `metadata.yaml` sidecar; without it the loaded
+model has no names, and this project routes detections by name — so the
+model loads cleanly and then detects nothing. Both `run.py --check` and
+`scripts/test_hailo.py` check for this before anything else.
+
+The artifact must contain exactly these class names:
 
 ```
 fuel   bumper_blue   bumper_red
 ```
 
-Routing is by name. A model with different names is not partially usable —
-the mismatched classes are silently dropped at runtime.
-
-## TensorRT (optional, later)
-
-Do this only after `.pt` inference is working and you have measured the
-frame rate. The engine is tied to the exact GPU, JetPack, and TensorRT
-version of the machine that built it, so it **must** be built on the
-Jetson itself and rebuilt after any JetPack upgrade.
+## Verifying an installed model
 
 ```bash
-yolo export model=models/best.pt format=engine half=True device=0
-# then point config.detector.model_path at models/best.engine
+# no accelerator needed: files, class names, architecture
+python scripts/test_hailo.py --model models/best_hailo_model --artifact-only
+
+# on the Pi, with the AI HAT+ attached
+python scripts/test_hailo.py --model models/best_hailo_model --image sample.jpg
+python scripts/benchmark_detector.py --images data/samples/
+python run.py --check
 ```
 
-Measure before and after with the `loop_fps` / `inference_ms` values the
-system publishes to NetworkTables. Do not assume a speedup — measure it.
+## Architecture matters
+
+The Raspberry Pi AI HAT+ **26 TOPS** carries a **Hailo-8**. The 13 TOPS
+board carries a **Hailo-8L**. A binary compiled for one does not run on the
+other. `metadata.yaml` records `hailo_arch`, and preflight warns when it
+disagrees with `detector.hailo_arch` in the config.
+
+## Where models come from
+
+Compilation happens on an **x86_64 Linux** machine — never on the Pi (the
+Hailo Dataflow Compiler is x86_64-only, and Ultralytics asserts it):
+
+```bash
+python training/export_hailo.py --check          # is this machine able to compile?
+python training/export_hailo.py --model models/best.pt --arch hailo8
+```
+
+See `training/README.md` for the full training → export → deploy flow.

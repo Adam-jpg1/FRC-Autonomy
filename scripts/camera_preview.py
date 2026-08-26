@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Live camera preview with FPS, resolution and frame age. No YOLO involved.
 
-    python scripts/camera_preview.py --camera 0
+    python scripts/camera_preview.py --list                   # find device paths
     python scripts/camera_preview.py --camera cam0            # by config name
+    python scripts/camera_preview.py --camera /dev/v4l/by-id/usb-Arducam-...
     python scripts/camera_preview.py --camera 0 --no-window   # headless stats
 
 This is bring-up stage 3/4: prove each camera streams, at the resolution
@@ -22,33 +23,69 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2  # noqa: E402
 
-from frc_perception.camera import ThreadedCamera  # noqa: E402
+from frc_perception.camera import ThreadedCamera, list_video_devices  # noqa: E402
 from frc_perception.config import CameraConfig, load_config  # noqa: E402
 from frc_perception.logging_setup import setup_logging  # noqa: E402
 
 
+def print_devices() -> int:
+    """List the persistent camera paths available on this machine."""
+    devices = list_video_devices()
+    if not devices:
+        print(
+            "No /dev/v4l/by-id or /dev/v4l/by-path entries.\n"
+            "On the Pi that means no USB camera is attached (or v4l-utils is\n"
+            "not installed: sudo apt install v4l-utils)."
+        )
+        return 1
+    print("Persistent camera paths (use these for CameraConfig.device_path):\n")
+    for entry in devices:
+        print(f"  [{entry['kind']:<7}] {entry['path']}")
+        print(f"            -> {entry['node']}")
+    print(
+        "\nEach USB camera usually claims TWO /dev/video nodes; the second is a\n"
+        "metadata node with no image formats. Confirm which is which with:\n"
+        "  v4l2-ctl -d <path> --list-formats-ext\n"
+        "\nIf both cameras are identical modules with the same USB serial, by-id\n"
+        "will not tell them apart -- use by-path (keyed on the physical port)\n"
+        "and always plug each camera into the same port."
+    )
+    return 0
+
+
 def resolve_camera(cfg, requested: str) -> CameraConfig:
-    """Accept either a configured camera name or a raw device index."""
+    """Accept a configured camera name, a device path, or a raw index."""
     for camera in cfg.cameras:
         if camera.name == requested:
             return camera
+    if requested.startswith("/dev/"):
+        return CameraConfig(name=os.path.basename(requested), device_path=requested)
     try:
         index = int(requested)
     except ValueError:
         names = [c.name for c in cfg.cameras]
-        raise SystemExit(f"no camera named {requested!r}; configured: {names}")
+        raise SystemExit(
+            f"no camera named {requested!r}; configured: {names}. "
+            "Run with --list to see the device paths on this machine."
+        )
     return CameraConfig(name=f"video{index}", device_index=index)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--camera", required=True, help="config name or /dev/video index")
+    parser.add_argument("--camera", help="config name, /dev path, or video index")
+    parser.add_argument("--list", action="store_true", help="list persistent device paths and exit")
     parser.add_argument("--width", type=int, help="override capture width")
     parser.add_argument("--height", type=int, help="override capture height")
     parser.add_argument("--fps", type=int, help="override requested frame rate")
     parser.add_argument("--no-window", action="store_true", help="print stats only")
     parser.add_argument("--seconds", type=float, default=0.0, help="exit after N seconds")
     args = parser.parse_args()
+
+    if args.list:
+        return print_devices()
+    if not args.camera:
+        raise SystemExit("give --camera NAME|/dev/path|INDEX, or --list")
 
     cfg = load_config()
     setup_logging(cfg.logging)

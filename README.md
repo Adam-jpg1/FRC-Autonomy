@@ -1,8 +1,15 @@
-# FRC 2026 — Jetson perception, localization, world model, navigation assist
+# FRC 2026 — Raspberry Pi 5 + Hailo-8 perception, localization, navigation assist
 
-A perception stack for an NVIDIA Jetson Orin Nano Super (8 GB) with two
-Arducam OV9782 USB global-shutter cameras, talking to a roboRIO over
-NetworkTables 4.
+A perception stack for a **Raspberry Pi 5 (8 GB)** with a **Raspberry Pi
+AI HAT+ (Hailo-8, 26 TOPS)** and two Arducam OV9782 USB global-shutter
+cameras, talking to a roboRIO over NetworkTables 4.
+
+> **Migrated from a Jetson Orin Nano.** Only the two hardware-facing
+> layers changed — frame capture and YOLO inference. Everything from
+> `Detection` downward (geometry, localization, world model, navigation,
+> the virtual controller, the NetworkTables contract) is the same code the
+> Jetson build used, and the roboRIO-facing interface is byte-for-byte
+> identical. See [Migration notes](#migration-notes-jetson--raspberry-pi-5).
 
 It turns camera frames and roboRIO telemetry into a field-coordinate model
 of what is around the robot, and recommends motion. **It never drives the
@@ -22,8 +29,8 @@ robot.** The roboRIO is the safety gate, always.
 2. [Data flow](#2-data-flow)
 3. [Coordinate conventions](#3-coordinate-conventions)
 4. [Setup — development machine](#4-setup--development-machine)
-5. [Setup — Jetson](#5-setup--jetson)
-6. [Installing the model](#6-installing-the-model)
+5. [Setup — Raspberry Pi 5 + AI HAT+](#5-setup--raspberry-pi-5--ai-hat)
+6. [Training, exporting and installing the model](#6-training-exporting-and-installing-the-model)
 7. [NetworkTables contract](#7-networktables-contract)
 8. [Camera calibration](#8-camera-calibration)
 9. [Distance calibration](#9-distance-calibration)
@@ -34,8 +41,10 @@ robot.** The roboRIO is the safety gate, always.
 14. [First robot bring-up](#14-first-robot-bring-up)
 15. [Safety](#15-safety)
 16. [Troubleshooting](#16-troubleshooting)
-17. [MUST INPUT checklist](#17-must-input-checklist)
-18. [What is verified and what is not](#what-is-verified-and-what-is-not)
+17. [Power and cooling](#17-power-and-cooling)
+18. [MUST INPUT checklist](#18-must-input-checklist)
+19. [Migration notes](#migration-notes-jetson--raspberry-pi-5)
+20. [What is verified and what is not](#what-is-verified-and-what-is-not)
 
 ---
 
@@ -45,21 +54,43 @@ The system is a stack of layers. Each depends only on the ones above it,
 and each has one job. A failure in a lower layer never corrupts a higher
 one.
 
-| module | responsibility |
-|---|---|
-| `frc_perception/camera.py` | threaded capture, health, reconnect, **frame freshness** |
-| `frc_perception/detector.py` | YOLO inference (`predict` only — never `track`) |
-| `frc_perception/geometry.py` | pixels → robot-relative range and bearing; frame transforms |
-| `frc_perception/apriltag_locator.py` | AprilTag detection and per-tag pose solving |
-| `frc_perception/field_map.py` | the official WPILib tag layout |
-| `frc_perception/localization.py` | odometry + tag fusion, **the pose-validity gate** |
-| `frc_perception/alliance.py` | which bumper color is an opponent |
-| `frc_perception/world_model.py` | cross-camera de-duplication, field-space tracking |
-| `frc_perception/navigation.py` | motion recommendation (no cameras, no NT) |
-| `frc_perception/virtual_controller.py` | motion → gamepad axes |
-| `frc_perception/nt_io.py` | the NetworkTables contract |
-| `frc_perception/app.py` | the loop that wires it together |
-| `frc_perception/config.py` | **every** tunable value in the system |
+| module | responsibility | hardware-specific? |
+|---|---|---|
+| `frc_perception/camera.py` | threaded USB/V4L2 capture, health, reconnect, **frame freshness** | yes |
+| `frc_perception/detector.py` | **the hardware boundary**: Hailo-8 and PyTorch backends behind one interface | yes |
+| `frc_perception/inference_scheduler.py` | two cameras → one accelerator, newest frame only, no queue | yes |
+| `frc_perception/geometry.py` | pixels → robot-relative range and bearing; frame transforms | no |
+| `frc_perception/apriltag_locator.py` | AprilTag detection and per-tag pose solving (Pi CPU) | no |
+| `frc_perception/field_map.py` | the official WPILib tag layout | no |
+| `frc_perception/localization.py` | odometry + tag fusion, **the pose-validity gate** | no |
+| `frc_perception/alliance.py` | which bumper color is an opponent | no |
+| `frc_perception/world_model.py` | cross-camera de-duplication, field-space tracking | no |
+| `frc_perception/navigation.py` | motion recommendation (no cameras, no NT) | no |
+| `frc_perception/virtual_controller.py` | motion → gamepad axes | no |
+| `frc_perception/nt_io.py` | the NetworkTables contract | no |
+| `frc_perception/app.py` | the loop that wires it together | — |
+| `frc_perception/config.py` | **every** tunable value in the system | — |
+
+### The hardware boundary
+
+```
+              HARDWARE-SPECIFIC                    HARDWARE-INDEPENDENT
+   ┌─────────────────────────────────┐   ┌────────────────────────────────┐
+   │ OV9782 USB cameras              │   │ Detection[]                    │
+   │   ↓  camera.py (V4L2 threads)   │   │   ↓  geometry.py               │
+   │   ↓  inference_scheduler.py     │   │   ↓  localization.py           │
+   │   ↓  detector.py                │   │   ↓  world_model.py            │
+   │        HailoDetectorBackend     │──►│   ↓  navigation.py             │
+   │        UltralyticsPyTorchBackend│   │   ↓  virtual_controller.py     │
+   └─────────────────────────────────┘   │   ↓  nt_io.py                  │
+                                          │   ↓  roboRIO safety gate       │
+                                          └────────────────────────────────┘
+```
+
+`geometry.py` contains no Hailo code. `world_model.py` imports no
+Ultralytics. `navigation.py` has never heard of a HEF file. Swapping
+accelerators means adding one class in `detector.py` and changing one
+config value — everything below `Detection[]` stays as it is.
 
 ### Deviations from the requested file layout
 
@@ -80,8 +111,12 @@ Three, each for a specific reason:
   works from the project root as the docs assume. **Edit
   `frc_perception/config.py`.**
 
-Tests for `camera.py`, `nt_io.py`, `config.py` and the app loop were added
-beyond the requested set.
+- **`frc_perception/inference_scheduler.py`** exists because there are two
+  cameras and one accelerator. It is scheduling policy, not detection, and
+  keeping it out of `detector.py` lets both be tested independently.
+
+Tests for `camera.py`, `nt_io.py`, `config.py`, the detector backends, the
+scheduler and the app loop were added beyond the requested set.
 
 ### Design principles, in priority order
 
@@ -103,16 +138,31 @@ beyond the requested set.
 
 ```
         ┌──────────────┐   ┌──────────────┐
-        │  camera 0    │   │  camera 1    │      independent threads,
-        │  OV9782 USB  │   │  OV9782 USB  │      latest-frame only
+        │  camera 0    │   │  camera 1    │      independent threads on the
+        │  OV9782 USB  │   │  OV9782 USB  │      Pi 5 CPU, latest frame only
         └──────┬───────┘   └──────┬───────┘
-               │ Frame(seq, timestamp, image)
+               │ Frame(camera_id, seq, capture_timestamp, image)
                │  ── frames older than frame_freshness_s are DISCARDED ──
                ▼                  ▼
      ┌───────────────────────────────────────┐
-     │  detector.py    YOLO predict()        │  fuel / bumper_blue / bumper_red
+     │  inference_scheduler.py               │  freshness-aware round robin,
+     │  NO QUEUE: newest frame per camera    │  skipped frames counted
      └──────────────┬────────────────────────┘
-                    │ Detection (pixels)
+                    │ one frame at a time
+                    ▼
+     ┌───────────────────────────────────────┐
+     │  detector.py -> HailoDetectorBackend  │  fuel / bumper_blue / bumper_red
+     │  Hailo-8 on the AI HAT+ (HailoRT)     │  routing by class NAME
+     └──────────────┬────────────────────────┘
+                    │ InferenceResult
+                    │  ── results older than max_detection_result_age_s
+                    │     are DISCARDED, not injected into the world model ──
+                    ▼
+     ┌───────────────────────────────────────┐
+     │  Detection[]  ==  THE HARDWARE        │
+     │  BOUNDARY. Nothing below knows what   │
+     │  produced these.                      │
+     └──────────────┬────────────────────────┘
                     ▼
      ┌───────────────────────────────────────┐   alliance.py
      │  class name ─► role                   │◄── FMSInfo/IsRedAlliance
@@ -248,7 +298,8 @@ Meters, seconds, radians — everywhere, except config fields ending in
 
 ## 4. Setup — development machine
 
-Everything except the Jetson-specific parts runs on a laptop.
+Everything except the accelerator itself runs on a laptop. The unit suite
+needs no Hailo hardware, no HailoRT, no Ultralytics and no torch.
 
 ```bash
 git clone <this-repo>
@@ -257,11 +308,15 @@ cd <this-repo>
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-pip install numpy opencv-python pytest        # enough for tests + tooling
+pip install numpy PyYAML pytest              # enough for the whole unit suite
+pip install opencv-python                    # for the calibration/preview tooling
 pip install ultralytics pupil-apriltags pyntcore   # optional, for the full stack
 
 pytest                            # must pass
 python run.py --check --no-camera-probe
+
+# on a laptop, select the development detector backend explicitly
+python run.py --backend pytorch --sim-nt --replay cam0=data/samples/
 ```
 
 In PyCharm: open the repo root as the project root, point the interpreter
@@ -270,98 +325,227 @@ import path for tests and each script inserts the repo root itself.
 
 ---
 
-## 5. Setup — Jetson
+## 5. Setup — Raspberry Pi 5 + AI HAT+
 
-### The order matters
+### Hardware
+
+| item | note |
+|---|---|
+| Raspberry Pi 5, 8 GB | 64-bit Raspberry Pi OS (Bookworm or newer) |
+| Raspberry Pi AI HAT+, 26 TOPS | carries a **Hailo-8**. The 13 TOPS board carries a Hailo-8L — a model compiled for one will not run on the other |
+| 2× Arducam OV9782 USB | UVC cameras. **Not** CSI, so Picamera2/libcamera is not used |
+| Active cooling | required — see [Power and cooling](#17-power-and-cooling) |
+
+### Three separate dependency sets
+
+Keep these straight; mixing them is the most common setup failure.
+
+| set | where | what |
+|---|---|---|
+| **APT / system** | the Pi | `hailo-all` — PCIe driver, HailoRT, `hailo_platform` bindings |
+| **Python runtime** | the Pi and dev machines | `requirements.txt` |
+| **Model compilation** | an x86_64 Linux machine, **never the Pi** | Hailo Dataflow Compiler + TensorFlow |
+
+### 1. System packages and the accelerator
 
 ```bash
-# 1. Build tools (pupil-apriltags compiles native code)
 sudo apt update
-sudo apt install -y cmake build-essential python3-pip v4l-utils
-
-# 2. NVIDIA's CUDA torch FIRST.
-#    The PyPI aarch64 torch wheels are CPU-ONLY. Install NVIDIA's
-#    JetPack-matched torch/torchvision wheels before anything else.
-#    Then verify — this MUST print True:
-python3 -c "import torch; print(torch.cuda.is_available())"
-
-# 3. Ultralytics WITHOUT letting pip replace torch
-pip3 install ultralytics --no-deps
-
-# 4. Re-verify. Every pip install is a chance to lose CUDA torch.
-python3 -c "import torch; print(torch.cuda.is_available())"
-
-# 5. The rest
-pip3 install pupil-apriltags pyntcore numpy
-
-# 6. OpenCV: JetPack ships one. If this already works, DO NOT
-#    pip-install opencv-python over it (the pip wheel is CPU-only).
-python3 -c "import cv2; print(cv2.__version__)"
+sudo apt full-upgrade          # AI HAT+ support wants a current firmware/kernel
+sudo apt install dkms
+sudo apt install hailo-all
+sudo reboot
 ```
 
-`requirements.txt` documents all of this and marks `opencv-python` as
-not-for-aarch64, but **do not run a bare `pip install -r requirements.txt`
-on the Jetson** until torch is settled.
-
-### Stable camera device numbers
-
-USB cameras re-enumerate across boots, and each OV9782 typically claims
-two `/dev/videoN` nodes. Find them:
+`hailo-all` pulls in the PCIe driver, HailoRT, the `hailo_platform` Python
+bindings and `hailortcli`. After the reboot, confirm the accelerator is
+alive:
 
 ```bash
-ls -l /dev/video*
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video0 --list-formats-ext
+hailortcli fw-control identify
 ```
 
-Then pin them with a udev rule keyed on the USB **port path**, and set
-`device_path` in the config to the resulting stable path (it overrides
-`device_index`):
+That must report a device and its architecture (`HAILO8`). If it does not:
 
 ```bash
-ls -l /dev/v4l/by-path/
+dmesg | grep -i hailo          # did the PCIe driver bind?
+lspci | grep -i hailo          # is the board seen at all?
 ```
 
-Doing this before your first competition is worth an hour of pit time.
+Re-seat the HAT and its ribbon before assuming anything is broken. On some
+boards PCIe Gen 3 must be enabled in `/boot/firmware/config.txt`
+(`dtparam=pciex1_gen=3`) — check the current Raspberry Pi AI HAT+
+documentation rather than trusting a value copied from a forum post.
 
-### Performance
+### 2. Python environment
 
-Start with `.pt` inference. It is the easiest thing to validate, and until
-it works there is nothing to optimize. The system publishes `loop_fps`,
-`inference_ms`, `apriltag_ms` and `perception_latency_ms` to
-NetworkTables — **measure those on your Jetson**. No frame rate is claimed
-here because none has been measured.
-
-If you need more, in this order:
-
-1. `sudo nvpmodel -m 0 && sudo jetson_clocks` (max power mode).
-2. Lower `detector.imgsz` (640 → 480) and re-measure mAP as well as FPS.
-3. Raise `apriltag.detect_every_n_frames` to 2 or 3.
-4. Raise `apriltag.quad_decimate`.
-5. **Then** consider TensorRT:
-   ```bash
-   yolo export model=models/best.pt format=engine half=True device=0
-   ```
-   The engine is tied to the exact GPU, JetPack and TensorRT version that
-   built it, so it must be built on the Jetson and rebuilt after any
-   JetPack upgrade. TensorRT is not required for a working system.
-
----
-
-## 6. Installing the model
+Create the venv with `--system-site-packages` so the apt-installed
+`hailo_platform` bindings stay importable:
 
 ```bash
-cp best.pt models/best.pt
-python scripts/test_yolo_image.py --model models/best.pt --image data/samples/
-python run.py --check          # verifies the class names
+sudo apt install python3-opencv cmake build-essential v4l-utils
+python3 -m venv --system-site-packages ~/frcvenv
+source ~/frcvenv/bin/activate
+pip install -r requirements.txt
+python -c "import hailo_platform, cv2, ultralytics; print('ok')"
 ```
 
-The weights must contain **exactly** `fuel`, `bumper_blue`, `bumper_red`.
-Routing is by name, so a model with different names is not partially
-usable — the mismatched classes are silently dropped. See
-[`training/README.md`](training/README.md).
+`ultralytics` will install a **CPU** build of torch on the Pi. That is
+correct and expected: production inference runs on the Hailo-8, and torch
+is only present as an Ultralytics dependency. There is no GPU build to
+look for and none is needed.
 
----
+### 3. Stable camera device paths
+
+USB cameras re-enumerate across boots, and each OV9782 typically claims two
+`/dev/videoN` nodes (the second is a metadata node). Find the persistent
+paths:
+
+```bash
+python scripts/camera_preview.py --list
+ls -l /dev/v4l/by-id/
+v4l2-ctl -d /dev/v4l/by-id/<...> --list-formats-ext
+```
+
+Put those paths in `cameras[].device_path` in
+`frc_perception/config.py`. If both cameras are identical modules with the
+same USB serial, `by-id` cannot tell them apart — use `/dev/v4l/by-path/`,
+which is keyed on the physical USB port, and always plug each camera into
+the same port. `run.py --check` reports a MUST INPUT until this is done.
+
+### 4. Performance
+
+Start by measuring. Nothing in this repository claims a frame rate.
+
+```bash
+python scripts/benchmark_detector.py --images data/samples/
+python scripts/benchmark_detector.py --video data/clips/practice.mp4 --frames 300
+```
+
+Then watch `loop_fps`, `camera_N_fps`, `camera_N_inference_fps`,
+`detector_latency_ms` and `frames_skipped` on the `Perception` table while
+the robot runs. Measure again after ten minutes with the case closed: the
+Pi 5 throttles, and a number taken in the first thirty seconds is not the
+number you get in the third match of the day.
+
+Knobs, in the order worth trying:
+
+1. Active cooling that actually works (check `vcgencmd measure_temp`).
+2. `detector.imgsz` — must match the size the HEF was compiled at, so
+   changing it means re-exporting.
+3. `max_inferences_per_cycle` — drop to 1 to halve accelerator load; the
+   round-robin still alternates fairly, each camera just runs at half rate.
+4. `apriltag.detect_every_n_frames` and `apriltag.quad_decimate` — AprilTag
+   detection runs on the CPU and is often the real bottleneck on a Pi, not
+   the accelerator.
+
+A high `frames_skipped` count is not a bug. It means capture is outrunning
+inference and the scheduler is correctly discarding old frames. It is a
+signal about how fast you can drive before the world model lags, not an
+error to suppress.
+
+## 6. Training, exporting and installing the model
+
+Training and deployment are **separate stages**. You do not retrain to
+re-export.
+
+```
+   TRAINING                          DEPLOYMENT
+   ────────                          ──────────
+   dataset                           best.pt
+      ↓  Colab / training machine       ↓  x86_64 Linux + Hailo DFC
+   best.pt                           best_hailo_model/
+      ↓  validate (.pt)                 ├── best.hef
+   mAP, confusion matrix             ├── metadata.yaml   ← class names live here
+                                     └── nms_config.json
+                                        ↓  copy the WHOLE directory
+                                     Raspberry Pi + HailoRT
+```
+
+### 1. Train (unchanged)
+
+See [`training/README.md`](training/README.md). Produces `best.pt` with
+exactly the classes `fuel`, `bumper_blue`, `bumper_red`.
+
+```bash
+python training/validate_yolo.py --model models/best.pt --data training/data.yaml
+```
+
+### 2. Compile for the Hailo-8 — **not on the Pi**
+
+Hailo compilation requires the Hailo Dataflow Compiler, which is x86_64
+Linux only. Ultralytics enforces this itself:
+
+```python
+assert LINUX and not ARM64, "Hailo export is only supported on Linux x86_64."
+# ultralytics/engine/exporter.py
+```
+
+On an x86_64 Linux machine (a Colab CPU runtime works) with the Dataflow
+Compiler installed:
+
+```bash
+python training/export_hailo.py --check            # environment only
+python training/export_hailo.py \
+    --model models/best.pt \
+    --data training/data.yaml \
+    --arch hailo8 \
+    --imgsz 640
+```
+
+* `--arch hailo8` — the AI HAT+ 26 TOPS carries a Hailo-8. The 13 TOPS
+  board is `hailo8l`, and the binaries are not interchangeable.
+* `--data` — INT8 calibration uses **our FRC images**, not a generic
+  calibration set. The Hailo-8 runs INT8; Ultralytics forces `quantize=8`
+  for this format and refuses FP32.
+* `--conf` defaults to a low 0.05 because for detection exports the
+  confidence is **baked into on-chip NMS** (`nms_config.json`). The
+  accelerator never returns a box below it, so the runtime threshold can
+  only filter further. Export low, tune at runtime.
+
+### 3. Compare accuracy honestly
+
+Quantization is not free, and small objects — distant `fuel` — lose the
+most. Record both numbers:
+
+```bash
+yolo val model=models/best.pt data=training/data.yaml imgsz=640           # baseline
+yolo val model=models/best_hailo_model data=training/data.yaml imgsz=640  # deployed
+```
+
+The second needs HailoRT and a Hailo device. Do not report the `.pt` mAP as
+if it were the deployed model's. If recall on `fuel` drops meaningfully,
+try more calibration images before changing anything else.
+
+### 4. Install on the Pi
+
+```bash
+rsync -av best_hailo_model/ pi@<robot-pi>:~/FRC/models/best_hailo_model/
+```
+
+**Copy the whole directory.** `metadata.yaml` carries the class names;
+Ultralytics reads them from that sidecar, and this project's class-name
+routing has nothing to route on without it. Copying only the `.hef`
+produces a model that loads and detects nothing — the single most likely
+deployment mistake, and the one `run.py --check` and
+`scripts/test_hailo.py` both look for first.
+
+```bash
+python scripts/test_hailo.py --model models/best_hailo_model --image sample.jpg
+python run.py --check
+```
+
+### Development backend
+
+For laptop work with no accelerator:
+
+```bash
+python run.py --backend pytorch --sim-nt --replay cam0=data/clips/practice.mp4
+```
+
+This loads `models/best.pt` through PyTorch. It is **development only**:
+`run.py --check` raises a WARNING if it is selected while `platform` is
+`raspberry_pi_5`, because running YOLO on the Pi's CPU during a match
+starves capture, AprilTags and the main loop of the cores they need.
 
 ## 7. NetworkTables contract
 
@@ -397,7 +581,13 @@ Required contract keys:
 Diagnostics (also always published):
 
 `camera_0_healthy`, `camera_1_healthy`, `camera_0_fps`, `camera_1_fps`,
-`model_loaded`, `odometry_fresh`, `tag_pose_available`, `tag_count`,
+`camera_0_inference_fps`, `camera_1_inference_fps`,
+`camera_0_frames_skipped`, `camera_1_frames_skipped`,
+`model_loaded`, `detector_healthy`, `detector_backend`,
+`detector_classes_ok`, `detector_error`, `detector_latency_ms`,
+`preprocess_ms`, `postprocess_ms`, `frames_skipped`,
+`stale_frames_dropped`, `stale_results_dropped`,
+`odometry_fresh`, `tag_pose_available`, `tag_count`,
 `localization_source`, `localization_quality`, `pose_invalid_reason`,
 `translation_disagreement_m`, `heading_disagreement_deg`, `loop_fps`,
 `perception_latency_ms`, `inference_ms`, `apriltag_ms`,
@@ -406,7 +596,16 @@ Diagnostics (also always published):
 `nav_omega_radps`, `nav_target_x`, `nav_target_y`, `nav_has_target`,
 `virtual_controller_enabled`.
 
-`camera_N_*` is indexed by position in `config.cameras`.
+`camera_N_*` is indexed by position in `config.cameras`. Capture rate
+(`camera_N_fps`) and inference rate (`camera_N_inference_fps`) are separate
+numbers: with one accelerator serving two cameras they are expected to
+differ, and conflating them hides whether capture or inference is the
+bottleneck.
+
+**The roboRIO-facing contract is unchanged from the Jetson build.** The
+required keys, their types, the subscriptions and the coordinate
+conventions are identical; robot code does not know or care which
+coprocessor is on the other end.
 
 `opponents_field_*` contains every robot that must be **avoided**. With a
 known alliance that is the opposing robots. With the alliance unknown or
@@ -576,9 +775,15 @@ sign is wrong. **Fix the config, never the math** — the math is tested.
 Most development needs no robot.
 
 ```bash
-# Simulated NetworkTables, no cameras, no model: the loop still runs,
-# publishes the full contract, and commands nothing.
+# Simulated NetworkTables, no cameras, no accelerator, no model: the loop
+# still runs, publishes the full contract, and commands nothing.
 python run.py --sim-nt
+
+# Development detector backend (PyTorch .pt) on a laptop
+python run.py --backend pytorch --sim-nt --replay cam0=data/clips/practice.mp4
+
+# Validate a deployed Hailo model's class contract without any hardware
+python scripts/test_hailo.py --model models/best_hailo_model --artifact-only
 
 # Replay a recorded clip through the real pipeline
 python run.py --sim-nt --replay cam0=data/clips/practice.mp4
@@ -620,7 +825,30 @@ the virtual controller (neutral default, clamp, deadband, slew,
 heartbeat), the camera freshness rule, the NT contract, config validation,
 and the app loop end to end.
 
-It requires only `numpy` and `pytest` — no OpenCV, no torch, no hardware.
+Migration-specific coverage:
+
+```bash
+pytest tests/test_detector_backends.py    # the hardware boundary
+pytest tests/test_inference_scheduler.py  # two cameras, one accelerator
+```
+
+* both backends emit an identical `Detection`;
+* a Hailo export directory missing `metadata.yaml` fails preflight;
+* a missing accelerator produces an unhealthy detector, **no detections,
+  and no PyTorch substitution**;
+* a newer frame replaces an older waiting one, and the skip is counted;
+* the scheduler holds no queue — 100 frames between cycles yield exactly
+  one inference;
+* stale frames never reach the accelerator; stale results never reach the
+  world model;
+* round robin keeps a fast camera from starving a slow one;
+* one camera's inference failure does not block the other;
+* a dead detector lets tracks age out, and navigation stays safe.
+
+It requires only `numpy`, `PyYAML` and `pytest` — **no HailoRT, no
+accelerator, no Ultralytics, no torch, no OpenCV.** Hailo hardware is
+mocked; the "accelerator absent" path is exactly what a development
+machine exercises.
 
 ---
 
@@ -631,22 +859,24 @@ Do these in order. Do not skip ahead to autonomous driving.
 | stage | command | what you are proving |
 |---|---|---|
 | **1** | `pytest` | the math and the logic are intact |
-| **2** | `python run.py --check` | config, imports, model, layout, calibration, MUST INPUTs |
-| **3** | `python scripts/camera_preview.py --camera 0` | camera 0 streams at the expected resolution and rate |
-| **4** | `python scripts/camera_preview.py --camera 1` | camera 1 does too, independently |
-| **5** | `python scripts/test_yolo_image.py --model models/best.pt --image shot.jpg` | the model loads and has the right classes |
-| **6** | `python run.py --sim-nt --replay cam0=clip.mp4` | the whole pipeline runs on recorded video |
-| **7** | `python run.py --sim-nt --replay cam0=/dev/…` or live with one camera enabled | live YOLO on one camera |
-| **8** | `python run.py --sim-nt` with both cameras enabled | live YOLO on both, watch `camera_N_fps` and `loop_fps` |
-| **9** | `python run.py` (controller still disabled) | NetworkTables connects; watch the `Perception` table |
-| **10** | watch `odometry_fresh` | roboRIO odometry arrives and its timestamp advances |
-| **11** | `python scripts/verify_localization.py` | tags are detected and produce poses |
-| **12** | `verify_localization.py`, pushing the robot | **X, Y and heading signs are right** (section 11) |
-| **13** | watch `balls_field_*` / `opponents_field_*` | detections land where the objects really are |
-| **14** | **robot on blocks**, `controller.enabled = True` | joystick polarity, with the wheels off the ground |
-| **15** | controlled drivetrain test, human on the deadman | assisted motion, small speed caps first |
+| **2** | `hailortcli fw-control identify` | the AI HAT+ is seated, powered and enumerated |
+| **3** | `python run.py --check` | platform, HailoRT, model artifact, config, calibration, MUST INPUTs |
+| **4** | `python scripts/camera_preview.py --list` | the persistent device paths, for `device_path` |
+| **5** | `python scripts/camera_preview.py --camera cam0` | camera 0 streams at the expected resolution and rate |
+| **6** | `python scripts/camera_preview.py --camera cam1` | camera 1 does too, independently |
+| **7** | `python scripts/test_hailo.py --model models/best_hailo_model --image shot.jpg` | the accelerator loads the model, has the right classes, and infers |
+| **8** | `python scripts/benchmark_detector.py --images data/samples/` | **measured** latency and FPS on this Pi |
+| **9** | `python run.py --sim-nt --replay cam0=clip.mp4` | the whole pipeline on recorded video |
+| **10** | `python run.py --sim-nt` with both cameras live | both cameras + the accelerator; watch `camera_N_inference_fps` and `frames_skipped` |
+| **11** | `python run.py` (controller still disabled) | NetworkTables connects; watch the `Perception` table |
+| **12** | watch `odometry_fresh` | roboRIO odometry arrives and its timestamp advances |
+| **13** | `python scripts/verify_localization.py` | tags are detected and produce poses |
+| **14** | `verify_localization.py`, pushing the robot | **X, Y and heading signs are right** (section 11) |
+| **15** | watch `balls_field_*` / `opponents_field_*` | detections land where the objects really are |
+| **16** | **robot on blocks**, `controller.enabled = True` | joystick polarity, with the wheels off the ground |
+| **17** | controlled drivetrain test, human on the deadman | assisted motion, small speed caps first |
 
-Stage 14 is where `invert_left_x` / `invert_left_y` / `invert_right_x` and
+Stage 16 is where `invert_left_x` / `invert_left_y` / `invert_right_x` and
 `field_oriented_drive` get confirmed. **On blocks. Every time.**
 
 ---
@@ -659,20 +889,21 @@ Stage 14 is where `invert_left_x` / `invert_left_y` / `invert_right_x` and
 fully neutral gamepad — every axis 0.0, every trigger 0.0, every button
 False, POV −1, `enabled = false`.
 
-### The roboRIO is the safety gate, not the Jetson
+### The roboRIO is the safety gate, not the coprocessor
 
 Robot code must accept virtual controls only when **all** of these hold:
 
 1. `VirtualController/enabled == true`;
 2. `VirtualController/heartbeat` is **advancing** (a frozen heartbeat means
-   the Jetson is dead or wedged — this code advances it every cycle,
-   enabled or not, precisely so you can check);
+   the Pi is dead or wedged — this code advances it every cycle, enabled or
+   not, precisely so you can check);
 3. a **human is holding a deadman** button on a real controller;
 4. the robot mode permits automation;
 5. and your own sanity limits on the resulting speeds.
 
-Never make the Jetson the last line of defense. It is a Linux box on a
-robot: it can hang, thermal throttle, or lose a USB camera mid-match.
+Never make the Pi the last line of defense. It is a Linux box on a robot:
+it can hang, thermal throttle, brown out on a weak supply, or lose a USB
+camera mid-match.
 
 ### Mechanisms ship neutral
 
@@ -690,11 +921,32 @@ in-place search rotation, which needs no field coordinates — and that is
 configurable off. This is the first branch in `Navigator.plan()` and it has
 its own tests.
 
+### A dead accelerator fails safe, and loudly
+
+If the Hailo-8 does not initialize or stops responding:
+
+- the detector reports **unhealthy** and produces **no detections** — never
+  fabricated ones;
+- **no CPU fallback is started.** Running YOLO on the Pi's CPU would starve
+  capture, AprilTags and the main loop, deliver a few frames per second,
+  and hide a hardware fault behind a plausible trickle of stale boxes;
+- existing world-model tracks **age out** on their own — the last known ball
+  position is never frozen in place;
+- `detector_healthy`, `model_loaded` and `detector_error` on the
+  `Perception` table say exactly what happened;
+- localization, AprilTags and navigation keep running, so the robot still
+  knows where it is and still refuses to translate when it does not.
+
 ### Stale data never masquerades as fresh
 
-- Frames older than `frame_freshness_s` are discarded before YOLO sees them.
+- Frames older than `frame_freshness_s` are discarded before the
+  accelerator sees them.
 - Odometry is fresh only while the RIO's timestamp advances.
-- Inference results older than `max_result_age_s` are dropped, not published.
+- Inference results older than `max_detection_result_age_s` are dropped
+  rather than injected into the world model — a correct answer about where
+  objects *were* is a wrong answer about where they are.
+- The scheduler holds no queue, so a slow cycle can never accumulate a
+  backlog of old frames.
 - Tracks age out; navigation is told whether a track is recent, aging, or
   expired.
 
@@ -708,9 +960,17 @@ its own tests.
 | `camera_N_fps` far below configured | driver ignored the FOURCC/resolution request | check the "driver gave" warning in the log; OV9782 needs `MJPG` for full rate |
 | Detections but no ranges | mount pose unmeasured (`mount_z_m = 0`) or box bottoms clipped | `run.py --check`; use `test_yolo_image.py --range cam0` to see the rejection reason |
 | Ranges consistently long or short | mount height or pitch off | re-measure, then `calibrate_distance.py` |
-| `model_loaded = false` | weights missing, or ultralytics/torch not installed | `run.py --check` names the reason |
-| Model detects nothing | class-name mismatch — routing is by name | `scripts/test_yolo_image.py` prints the contract check |
-| YOLO very slow | CPU-only torch on the Jetson | `python3 -c "import torch; print(torch.cuda.is_available())"` must be True |
+| `model_loaded = false` / `detector_healthy = false` | no accelerator, no model directory, or a class mismatch | `run.py --check`, then `scripts/test_hailo.py` — it reports which of the seven stages failed |
+| `hailortcli` not found | `hailo-all` not installed | `sudo apt install hailo-all && sudo reboot` |
+| `hailortcli fw-control identify` fails | HAT not seated, or the PCIe driver did not bind | `dmesg \| grep -i hailo`, `lspci \| grep -i hailo`, re-seat the board |
+| Model loads but detects nothing | only the `.hef` was copied, so there are no class names | copy the whole export directory; `test_hailo.py` stage 5 checks this |
+| `class mismatch` at preflight | the export was built from the wrong weights | re-export from a `best.pt` whose names are exactly the three expected |
+| Model refuses to load on the Pi | compiled for the wrong architecture (`hailo8l` vs `hailo8`) | check `hailo_arch` in `metadata.yaml`; re-export with `--arch hailo8` |
+| Detection quality worse than the `.pt` | INT8 quantization loss, worst on small/distant objects | compare `yolo val` on both; use more representative calibration images |
+| High `frames_skipped` | capture is outrunning inference | not a bug — it is the latest-frame policy. Lower `max_inferences_per_cycle` or `imgsz`, or improve cooling |
+| High `stale_results_dropped` | inference is slower than `max_detection_result_age_s` | benchmark, cool the Pi, reduce `imgsz` (requires re-export) |
+| Everything slows down after a few minutes | Pi 5 thermal throttling | `vcgencmd measure_temp`, `vcgencmd get_throttled`; fix cooling |
+| Random reboots / USB dropouts | undersized or unstable supply | see [Power and cooling](#17-power-and-cooling) |
 | `pose_valid` never becomes true | no accepted tag fix yet | check `tag_count`, `apriltag.layout` in `--check`, and camera calibration — the tag detector refuses uncalibrated cameras |
 | `ODOMETRY STALE` but the robot is running | `Odometry/timestamp` not being republished | publish it every robot loop |
 | `LARGE LOCALIZATION DISAGREEMENT` | camera mount sign wrong, or a mirrored pose from robot code | `scripts/verify_localization.py`, section 11 |
@@ -719,6 +979,7 @@ its own tests.
 | Teammates treated as obstacles | alliance unknown/stale | check `FMSInfo/IsRedAlliance`; with it unknown, every robot is an obstacle by design |
 | NT never connects | wrong team number, or mDNS flaky | set `networktables.server_override = "10.TE.AM.2"` |
 | Virtual controller does nothing | it is disabled by default | that is the safe default; see section 15 before changing it |
+| Cameras swapped after a reboot | using `/dev/videoN` instead of a persistent path | set `device_path` from `camera_preview.py --list` |
 | Robot drives the wrong way on blocks | joystick polarity | flip `invert_left_x/y`, `invert_right_x` — never patch the math |
 
 Logs: console plus `logs/perception.log` (rotating, 5 MB × 5). State
@@ -727,7 +988,60 @@ errors are rate-limited with a suppressed count.
 
 ---
 
-## 17. MUST INPUT checklist
+## 17. Power and cooling
+
+The Pi 5 with an AI HAT+ draws meaningfully more than a Pi 4, and both the
+SoC and the Hailo-8 throttle when hot. Neither failure is loud: the robot
+just gets slower, usually in the third match of the day.
+
+### Power
+
+* The Pi 5 expects a **5 V supply with real headroom**. The official
+  desktop supply is 5 V / 5 A (27 W); the AI HAT+ and two USB cameras all
+  draw from the same rail. Undervoltage shows up as USB dropouts and
+  spontaneous reboots long before it shows up as a clear error.
+* An FRC robot's 12 V bus is **not** a clean supply. It sags hard when the
+  drivetrain draws current, and a regulator that is adequate at rest can
+  brown the Pi out during a push match — exactly when you want perception
+  working.
+* Check for undervoltage on the Pi:
+
+  ```bash
+  vcgencmd get_throttled     # 0x0 is what you want
+  dmesg | grep -i voltage
+  ```
+
+```
+# MUST INPUT: the actual 12 V -> 5 V regulator, its continuous and peak
+# current rating, its fusing, and how it is wired into the robot's power
+# distribution. This depends on your electrical system and is not invented
+# here. Size it for the Pi 5 + AI HAT+ + two USB cameras with margin for
+# brownout during drivetrain current spikes, and verify with
+# `vcgencmd get_throttled` under real driving load, not on the bench.
+```
+
+### Cooling
+
+* **Active cooling is required**, not optional — the official Pi 5 Active
+  Cooler or an equivalent heatsink-and-fan. The AI HAT+ mounts over the Pi
+  and restricts airflow, so a passive heatsink that was fine on a bare
+  board may not be.
+* Watch it under real load:
+
+  ```bash
+  vcgencmd measure_temp
+  vcgencmd get_throttled
+  ```
+
+* Benchmark **warm**: run `scripts/benchmark_detector.py` for several
+  minutes with the electronics enclosure closed. A number taken in the
+  first thirty seconds is not the number you get in a match.
+* Mount the Pi where it gets air and is not sitting against a motor
+  controller or a battery.
+
+---
+
+## 18. MUST INPUT checklist
 
 Values that cannot be known without the physical robot, a calibration run,
 a trained model, or the official 2026 game manual. `python run.py --check`
@@ -736,26 +1050,59 @@ lists every one still unfilled, and scans the source for the markers.
 | # | value | where | how to get it |
 |---|---|---|---|
 | 1 | Team number | `networktables.team_number` | you know this one |
-| 2 | Camera device indexes / paths | `cameras[].device_index` / `device_path` | `ls /dev/video*`, `v4l2-ctl --list-devices`; pin with udev |
+| 2 | Camera persistent device paths | `cameras[].device_path` | `python scripts/camera_preview.py --list` |
 | 3 | Camera intrinsics (fx, fy, cx, cy, distortion) | `cameras[]` | `scripts/calibrate_intrinsics.py` |
 | 4 | Lens horizontal FOV | `cameras[].horizontal_fov_deg` | your Arducam variant's spec (fallback only) |
 | 5 | Camera mount positions | `cameras[].mount_x_m/_y_m/_z_m` | tape measure, on the robot |
 | 6 | Camera mount rotations | `cameras[].pitch_deg/yaw_deg/roll_deg` | measure on the robot; down/CCW positive |
 | 7 | Distance polynomials | `cameras[].distance_poly` | `scripts/calibrate_distance.py` |
 | 8 | Exposure / gain | `cameras[].manual_exposure/manual_gain` | `scripts/camera_preview.py` under real field lighting |
-| 9 | Trained model path | `detector.model_path` | `training/`, then copy `best.pt` |
-| 10 | FUEL diameter | `detector.fuel_diameter_m` | official FRC 2026 game manual |
-| 11 | Bumper face width | `detector.bumper_width_m` | measure a real robot |
-| 12 | AprilTag size | `localization.apriltag.tag_size_m` | official FRC 2026 game manual |
-| 13 | Field layout JSON | `data/field_layout.json` | `scripts/download_field_layout.py` |
-| 14 | Fallback field dimensions | `localization.fallback_field_*` | 2026 manual (only if running without the layout) |
-| 15 | Assisted speed caps | `navigation.max_speed_mps`, `max_omega_radps` | your drivetrain, conservatively |
-| 16 | Robot radii | `navigation.opponent_radius_m`, `own_robot_radius_m` | half the diagonal of a bumpered robot |
-| 17 | Field search point | `navigation.search_point_field` | 2026 field coordinates (None ⇒ spin-search, which is safe) |
-| 18 | Field-oriented drive? | `controller.field_oriented_drive` | match your teleop bindings |
-| 19 | Joystick polarity | `controller.invert_left_x/_y`, `invert_right_x` | **robot on blocks** |
-| 20 | Full-scale stick speeds | `controller.full_scale_speed_mps`, `full_scale_omega_radps` | what a fully deflected stick means to your robot |
-| 21 | Mechanism policy and bindings | `virtual_controller.mechanism_policy` / `_apply_mechanism` | your robot's mechanisms |
+| 9 | Compiled Hailo model | `detector.hailo_model_path` | `training/export_hailo.py` on x86_64 Linux, then copy the whole directory |
+| 10 | Trained weights | `detector.pytorch_model_path` | `training/`, then copy `best.pt` |
+| 11 | FUEL diameter | `detector.fuel_diameter_m` | official FRC 2026 game manual |
+| 12 | Bumper face width | `detector.bumper_width_m` | measure a real robot |
+| 13 | AprilTag size | `localization.apriltag.tag_size_m` | official FRC 2026 game manual |
+| 14 | Field layout JSON | `data/field_layout.json` | `scripts/download_field_layout.py` |
+| 15 | Fallback field dimensions | `localization.fallback_field_*` | 2026 manual (only if running without the layout) |
+| 16 | Assisted speed caps | `navigation.max_speed_mps`, `max_omega_radps` | your drivetrain, conservatively |
+| 17 | Robot radii | `navigation.opponent_radius_m`, `own_robot_radius_m` | half the diagonal of a bumpered robot |
+| 18 | Field search point | `navigation.search_point_field` | 2026 field coordinates (None ⇒ spin-search, which is safe) |
+| 19 | Field-oriented drive? | `controller.field_oriented_drive` | match your teleop bindings |
+| 20 | Joystick polarity | `controller.invert_left_x/_y`, `invert_right_x` | **robot on blocks** |
+| 21 | Full-scale stick speeds | `controller.full_scale_speed_mps`, `full_scale_omega_radps` | what a fully deflected stick means to your robot |
+| 22 | Mechanism policy and bindings | `virtual_controller.mechanism_policy` / `_apply_mechanism` | your robot's mechanisms |
+| 23 | **Robot 12 V → 5 V power solution** | README §17 | your electrical system — size it and verify under load |
+
+---
+
+## Migration notes: Jetson → Raspberry Pi 5
+
+The project was originally built for an NVIDIA Jetson Orin Nano Super.
+Migrating to the Pi 5 + Hailo-8 changed only the hardware-facing layers.
+
+### What changed
+
+| Jetson | Raspberry Pi 5 + Hailo-8 |
+|---|---|
+| CUDA PyTorch / TensorRT inference | Hailo-8 via HailoRT, through Ultralytics' `HailoBackend` |
+| `.pt` / `.engine` single-file model | `best_hailo_model/` directory (`.hef` + `metadata.yaml` + `nms_config.json`) |
+| TensorRT engine built on-device | HEF compiled on **x86_64 Linux only**; the Pi never compiles |
+| `YoloDetector` (one concrete class) | `DetectorBackend` interface + `HailoDetectorBackend` / `UltralyticsPyTorchBackend` |
+| detection ran on every fresh frame inline | `InferenceScheduler`: latest-frame, round-robin, no queue |
+| JetPack / CUDA / `torch.cuda.is_available()` setup | `sudo apt install hailo-all`, `hailortcli fw-control identify` |
+| FP16 on GPU | INT8, calibrated on our own FRC images |
+| `/dev/videoN` indexes | persistent `/dev/v4l/by-id/` paths |
+
+### What did **not** change
+
+Geometry, ranging, AprilTag detection and pose solving, the field map,
+localization and the pose-validity gate, alliance routing, the world model,
+navigation and the pose-invalid safety rule, the virtual controller, and
+the entire NetworkTables contract. Those modules are untouched except for
+one identifier rename (`camera_name` → `camera_id`) applied consistently
+across the boundary types.
+
+The roboRIO does not know the coprocessor changed.
 
 ---
 
@@ -777,17 +1124,42 @@ lists every one still unfilled, and scans the source for the markers.
   deadband/slew/heartbeat behavior.
 - Contracts: config validation, the `Perception` key set, the model
   class-name check.
-- `python run.py --check` runs and reports correctly.
+- `python run.py --check` runs and reports correctly on a machine with no
+  accelerator (warnings, not import crashes).
+- The detector hardware boundary: both backends emit an identical
+  `Detection`; the Hailo artifact preflight (directory, `.hef`,
+  `metadata.yaml`, class names, architecture) using a fabricated export
+  directory; safe failure with no accelerator and **no CPU fallback**.
+- The inference scheduler against a fake clock and fake cameras:
+  latest-frame selection, skip counting, no queue, stale-frame refusal,
+  stale-result rejection, round-robin fairness, per-camera failure
+  isolation, and the full timing chain.
+- The Ultralytics Hailo export and inference API was read directly from
+  the installed package source (8.4.129) rather than recalled: format name,
+  the `name`/architecture argument and its valid values, forced INT8, the
+  x86_64-only assertion, the output directory layout, and the fact that
+  `metadata.yaml` is where class names come from.
 
-### Written but NOT verified — requires hardware
+### Written but NOT verified — requires the Pi and the AI HAT+
 
-- Real OV9782 behavior: actual USB bandwidth with two cameras, MJPG
-  negotiation, exposure/gain units, reconnect behavior on a real unplug.
-- Actual `/dev/videoN` indexes and their stability across boots.
-- Real CUDA inference on the Jetson, and any frame rate whatsoever. **No
-  FPS number is claimed anywhere in this repository** because none has been
-  measured.
-- TensorRT export and its speedup.
+- **Anything involving the Hailo-8 itself.** No Hailo hardware, no
+  HailoRT, and no Hailo Dataflow Compiler were present. Specifically
+  unverified: `hailo-all` installation, `hailortcli fw-control identify`,
+  loading a real `.hef`, on-chip NMS output, and inference latency.
+  `scripts/test_hailo.py` has never had a stage 1, 2, 4 or 6 pass.
+- **The Hailo export itself.** `training/export_hailo.py` was written
+  against the Ultralytics exporter source but has never compiled a HEF —
+  the Dataflow Compiler is a registered download that cannot be installed
+  unattended.
+- **Quantization accuracy.** INT8 loss versus the `.pt` baseline is
+  unmeasured. Measure it before trusting the model on distant `fuel`.
+- Real OV9782 behavior on a Pi 5: USB bandwidth with two cameras, MJPG
+  negotiation, exposure/gain units, reconnect on a real unplug.
+- Actual persistent device paths and their stability across boots.
+- **Any frame rate whatsoever.** No FPS number is claimed anywhere in this
+  repository because none has been measured. Run
+  `scripts/benchmark_detector.py` on the real Pi, warm.
+- Thermal behavior and the power solution under drivetrain load.
 - A NetworkTables connection to a real roboRIO, and end-to-end latency.
 - Real AprilTag detection, and whether the camera mount numbers you enter
   are correct. The frame chain is proven self-consistent; only
@@ -798,6 +1170,6 @@ lists every one still unfilled, and scans the source for the markers.
 - Real FMS alliance data.
 - YOLO detection quality, which depends entirely on your dataset.
 
-**This system has never been run on a robot.** Nothing here is "production
-verified". Work the bring-up order in section 14 and verify each stage
-yourself.
+**This system has never been run on a robot, and has never touched a Hailo
+accelerator.** Nothing here is "production verified". Work the bring-up
+order in section 14 and verify each stage yourself.

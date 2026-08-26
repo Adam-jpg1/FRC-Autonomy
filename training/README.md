@@ -1,6 +1,6 @@
 # Training the FRC 2026 detection model
 
-The Jetson runtime routes every detection by **class name**. These three
+The runtime routes every detection by **class name**. These three
 names are a hard contract with `frc_perception/config.py`:
 
 ```
@@ -168,10 +168,13 @@ export_best(weights, drive_dir='/content/drive/MyDrive/frc2026_models')
 
 ### Which model size
 
-Start with `yolov8n`. It is the size that comfortably runs two camera
-streams in real time on an Orin Nano. Move to `yolov8s` only after you
-have measured actual FPS on the actual Jetson and found headroom — see
-the TensorRT section of the top-level README.
+Start with `yolov8n`. Move up only after you have **measured** actual FPS
+on the actual Raspberry Pi 5 + Hailo-8 with
+`scripts/benchmark_detector.py` and found headroom. No frame rate is
+assumed anywhere in this project.
+
+Ultralytics' Hailo export supports YOLOv8, YOLO11 and YOLO26 detection
+models. If you train something else, it will not compile.
 
 ### Reading the results
 
@@ -185,7 +188,81 @@ the TensorRT section of the top-level README.
 
 ---
 
-## 4. Validate before deploying
+## 4. Deploy to the Hailo-8
+
+Training and deployment are **separate stages**. You do not retrain in
+order to re-export.
+
+```
+TRAINING                    DEPLOYMENT
+--------                    ----------
+dataset -> best.pt          best.pt -> best_hailo_model/
+(Colab, GPU)                (x86_64 Linux + Hailo Dataflow Compiler)
+```
+
+### Compilation does NOT happen on the Raspberry Pi
+
+The Hailo Dataflow Compiler is x86_64 Linux only, and Ultralytics enforces
+it:
+
+```python
+assert LINUX and not ARM64, "Hailo export is only supported on Linux x86_64."
+```
+
+The Pi only needs HailoRT (`sudo apt install hailo-all`) to *run* an
+already-compiled model.
+
+### Exporting
+
+On an x86_64 Linux machine with the Dataflow Compiler installed (a Colab
+CPU runtime works):
+
+```bash
+python training/export_hailo.py --check           # can this machine compile?
+python training/export_hailo.py \
+    --model models/best.pt \
+    --data training/data.yaml \
+    --arch hailo8 \
+    --imgsz 640
+```
+
+* `--arch hailo8` — the AI HAT+ 26 TOPS is a Hailo-8; the 13 TOPS board is
+  `hailo8l`, and the binaries are not interchangeable.
+* `--data` — INT8 calibration uses **our own FRC images**. The Hailo-8 runs
+  INT8; Ultralytics forces `quantize=8` for this format and refuses FP32.
+  A generic calibration set gives a model calibrated for the wrong scene.
+* `--conf` defaults low (0.05) because for detection exports the confidence
+  is **baked into on-chip NMS**. The accelerator never returns a box below
+  it, so the runtime threshold can only filter further.
+
+The output is a **directory**:
+
+```
+best_hailo_model/
+├── best.hef
+├── metadata.yaml       <- class names live here
+└── nms_config.json
+```
+
+Deploy all of it. Copying only the `.hef` produces a model with no class
+names, and this project routes by name — it would load and detect nothing.
+
+### Quantization changes accuracy — measure it
+
+```bash
+yolo val model=models/best.pt data=training/data.yaml imgsz=640            # baseline
+yolo val model=models/best_hailo_model data=training/data.yaml imgsz=640   # deployed
+```
+
+Record both `mAP50` numbers in your build log. INT8 loss falls hardest on
+small objects — for us that is distant `fuel`. If recall drops
+meaningfully, use more (and more representative) calibration images before
+changing anything else. Never quote the `.pt` number as if it were the
+deployed model's.
+
+---
+
+## 5. Validate before deploying
 
 Locally, without Colab:
 
@@ -194,14 +271,21 @@ python training/validate_yolo.py --dataset ./dataset
 python training/validate_yolo.py --model models/best.pt --data training/data.yaml
 ```
 
-Then on the Jetson:
+Then on the Raspberry Pi:
 
 ```bash
-cp best.pt models/best.pt
-python scripts/test_yolo_image.py --model models/best.pt --image data/samples/
+# the deployed artifact
+python scripts/test_hailo.py --model models/best_hailo_model --image sample.jpg
+python scripts/benchmark_detector.py --images data/samples/
 python run.py --check          # confirms the class names match the runtime
 ```
 
-`run.py --check` reports `model.classes` as FAIL if the names do not match
-exactly. Fix that before anything else — every downstream layer depends on
-it.
+On a development machine, the `.pt` can be checked directly:
+
+```bash
+python scripts/test_yolo_image.py --model models/best.pt --image data/samples/
+```
+
+`run.py --check` reports a class mismatch as FAIL for both the `.pt` and
+the compiled Hailo artifact. Fix that before anything else — every
+downstream layer routes by class name.

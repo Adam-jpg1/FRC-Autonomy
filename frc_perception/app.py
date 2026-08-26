@@ -7,6 +7,11 @@ it, and a failure in a lower layer never corrupts a higher one:
     -> field transform -> world model -> navigation -> virtual controller
     -> NetworkTables -> (roboRIO safety gate)
 
+Only the first two layers know what hardware this is running on.  Frames
+come from USB cameras on a Raspberry Pi 5; inference runs on a Hailo-8 via
+:mod:`frc_perception.detector`; and from :class:`~frc_perception.types.Detection`
+downward, nothing changes if the accelerator does.
+
 RESILIENCE
 ----------
 Every stage runs inside :meth:`PerceptionApp._stage`, which contains the
@@ -20,8 +25,14 @@ TWO RULES THAT MATTER MORE THAN THE REST
 * Detections are only transformed into field coordinates while the pose
   is VALID.  With a bad pose those transforms are fiction, so the world
   model is cleared instead of being poisoned with phantom objects.
-* Frames are pulled with :meth:`FrameSource.read_fresh`.  A frozen camera
-  yields nothing rather than feeding a stale image to YOLO.
+* Frames reach the accelerator only through
+  :class:`~frc_perception.inference_scheduler.InferenceScheduler`, which
+  takes each camera's NEWEST frame, refuses stale ones, and discards a
+  result that finished too late to describe the present.  A frozen camera
+  yields nothing rather than feeding a stale image to the detector.
+* A detector failure produces NO detections -- never fabricated ones and
+  never a silent CPU fallback.  Tracks then age out on their own and
+  navigation degrades safely.
 """
 
 from __future__ import annotations
@@ -36,8 +47,9 @@ from .alliance import alliance_from_is_red, is_obstacle, role_for_class
 from .apriltag_locator import AprilTagLocalizer, to_grayscale
 from .camera import CameraManager, build_camera_manager
 from .config import AppConfig, CLASS_FUEL
-from .detector import YoloDetector
+from .detector import DetectorBackend, build_detector_backend
 from .field_map import try_load_field_map
+from .inference_scheduler import InferenceScheduler
 from .geometry import robot_to_field
 from .localization import PoseEstimator
 from .logging_setup import RateLimiter, StateLogger
@@ -46,7 +58,9 @@ from .nt_io import NTBackend, NetworkTablesIO, build_perception_payload
 from .types import (
     Alliance,
     DesiredMotion,
+    Detection,
     FieldObservation,
+    InferenceResult,
     LoopStats,
     ObjectRole,
     Pose2d,
@@ -81,7 +95,8 @@ class PerceptionApp:
         self.cameras: CameraManager = build_camera_manager(
             cfg.cameras, cfg.frame_freshness_s, replay_paths
         )
-        self.detector = YoloDetector(cfg.detector)
+        self.detector: DetectorBackend = build_detector_backend(cfg.detector)
+        self.scheduler = InferenceScheduler(self.cameras, self.detector, cfg)
 
         self.field_map, field_map_error = try_load_field_map(
             cfg.localization.apriltag.field_layout_path
@@ -112,7 +127,14 @@ class PerceptionApp:
     def start(self) -> None:
         logger.info("starting perception app")
         self.cameras.start()
-        self.detector.load()
+        if not self.detector.load():
+            logger.error(
+                "detector backend %r did not start: %s. The system will run "
+                "WITHOUT object detection: no fuel or opponent tracks will be "
+                "created, existing tracks age out, and navigation degrades "
+                "safely. No CPU fallback is started on purpose.",
+                self.cfg.detector.backend, self.detector.load_error,
+            )
         self.apriltags.load()
         self.nt.connect()
         self._running = True
@@ -121,6 +143,10 @@ class PerceptionApp:
         logger.info("stopping perception app")
         self._running = False
         self.cameras.stop()
+        try:
+            self.detector.close()
+        except Exception as exc:  # noqa: BLE001 - shutdown is best effort
+            logger.warning("detector close failed: %s", exc)
         try:
             # Leave the gamepad in a known-neutral state on the way out.
             self.nt.publish_controller(self.controller.neutral())
@@ -203,10 +229,14 @@ class PerceptionApp:
         pose_estimate = self.estimator.update(moment)
 
         inference_started = time.monotonic()
-        robot_observations = self._stage(
-            "detect", lambda: self._detect_objects(frames, moment), []
+        inference_results = self._stage(
+            "detect", self.scheduler.run_cycle, []
         ) or []
         self.stats.inference_ms = (time.monotonic() - inference_started) * 1000.0
+        robot_observations = self._stage(
+            "ranging", lambda: self._range_results(inference_results, moment), []
+        ) or []
+        self._update_detector_stats()
 
         self._stage(
             "world_model",
@@ -296,43 +326,36 @@ class PerceptionApp:
         if estimate is not None:
             self.estimator.add_tag_estimate(estimate, now)
 
-    def _detect_objects(self, frames: Dict[str, Any], now: float) -> List[RobotObservation]:
-        if not self.detector.loaded:
+    def _range_results(
+        self, results: Sequence[InferenceResult], now: float
+    ) -> List[RobotObservation]:
+        """Turn this cycle's detections into robot-frame observations.
+
+        The scheduler has already refused stale frames and dropped results
+        that finished too late, so everything arriving here is young enough
+        to act on.  Ranging is per-detection and per-camera, using that
+        camera's own intrinsics and measured mount pose.
+        """
+        if not self.detector.healthy():
             self._rate_limiter.log(
-                logger, logging.WARNING, "model_missing",
-                "YOLO model not loaded (%s); no object detection",
+                logger, logging.WARNING, "detector_unhealthy",
+                "detector (%s) is UNHEALTHY: %s -- producing no detections",
+                self.cfg.detector.backend,
                 self.detector.load_error or "unknown reason", now=now,
             )
             return []
 
         observations: List[RobotObservation] = []
-        for name, frame in frames.items():
-            cam = self._camera_by_name.get(name)
+        for result in results:
+            cam = self._camera_by_name.get(result.camera_id)
             if cam is None or not cam.use_for_objects:
                 continue
-            try:
-                detections = self.detector.detect(frame)
-            except Exception as exc:  # noqa: BLE001 - contained per camera
-                self._rate_limiter.log(
-                    logger, logging.WARNING, f"infer:{name}",
-                    "inference failed on %s: %s", name, exc, now=now,
-                )
-                continue
-
-            age = time.monotonic() - frame.timestamp
-            if age > self.cfg.max_result_age_s:
-                # The answer is correct but no longer describes the present.
-                self._rate_limiter.log(
-                    logger, logging.WARNING, f"stale_result:{name}",
-                    "dropping %s result: %.0f ms old (limit %.0f ms)",
-                    name, age * 1000.0, self.cfg.max_result_age_s * 1000.0, now=now,
-                )
-                continue
-
-            observations.extend(self._range_detections(detections, cam))
+            observations.extend(self._range_detections(result.detections, cam))
         return observations
 
-    def _range_detections(self, detections, cam) -> List[RobotObservation]:
+    def _range_detections(
+        self, detections: Sequence[Detection], cam
+    ) -> List[RobotObservation]:
         results: List[RobotObservation] = []
         for detection in detections:
             role = role_for_class(detection.class_name, self.alliance)
@@ -350,18 +373,13 @@ class PerceptionApp:
                 if detection.class_name == CLASS_FUEL
                 else self.cfg.detector.bumper_width_m
             )
-            estimate = self._stage(
-                "ranging",
-                lambda d=detection, c=cam, w=known_width: _range_one(
-                    d, c, self.cfg.ranging, w
-                ),
-            )
+            estimate = _range_one(detection, cam, self.cfg.ranging, known_width)
             if estimate is None or not estimate.valid:
                 continue
             results.append(
                 RobotObservation(
-                    camera_name=detection.camera_name,
-                    timestamp=detection.timestamp,
+                    camera_id=detection.camera_id,
+                    timestamp=detection.capture_timestamp,
                     class_name=detection.class_name,
                     role=role,
                     confidence=detection.confidence,
@@ -374,6 +392,22 @@ class PerceptionApp:
             )
         return results
 
+    def _update_detector_stats(self) -> None:
+        """Copy the scheduler's and backend's counters into LoopStats."""
+        self.stats.detector_latency_ms = self.detector.last_latency_ms
+        self.stats.preprocess_ms = self.detector.last_preprocess_ms
+        self.stats.postprocess_ms = self.detector.last_postprocess_ms
+        self.stats.frames_skipped = self.scheduler.total_skipped
+        self.stats.stale_frames_dropped = self.scheduler.total_stale_frames
+        self.stats.stale_results_dropped = self.scheduler.total_stale_results
+        health = self.detector.health()
+        self._states.log(
+            "detector_healthy", health.healthy,
+            f"detector {health.backend} healthy ({health.device_report})",
+            f"DETECTOR {health.backend.upper()} UNHEALTHY: {health.last_error} "
+            "-- no new detections; tracks will age out",
+        )
+
     def _update_world(self, observations, pose_estimate, now: float) -> None:
         if not pose_estimate.valid:
             # Field-space tracks recorded against an unknown pose are worse
@@ -383,7 +417,7 @@ class PerceptionApp:
         pose = pose_estimate.pose
         field_observations = [
             FieldObservation(
-                camera_name=observation.camera_name,
+                camera_id=observation.camera_id,
                 timestamp=observation.timestamp,
                 class_name=observation.class_name,
                 role=observation.role,
@@ -413,13 +447,19 @@ class PerceptionApp:
         fuel = self.world.game_pieces(now)
         opponents = self.world.obstacle_robots(now)
         health = self.cameras.health()
-        camera_health = [
-            (
-                health[name].healthy if name in health else False,
-                health[name].fps if name in health else 0.0,
+        detector_health = self.detector.health()
+        camera_health = []
+        for name in self._camera_order:
+            camera = health.get(name)
+            inference = self.scheduler.stats.get(name)
+            camera_health.append(
+                (
+                    camera.healthy if camera else False,
+                    camera.fps if camera else 0.0,
+                    inference.fps(now) if inference else 0.0,
+                    inference.skipped_frames if inference else 0,
+                )
             )
-            for name in self._camera_order
-        ]
 
         latency_ms = 0.0
         if frames:
@@ -444,7 +484,17 @@ class PerceptionApp:
             pose_invalid_reason=pose_estimate.invalid_reason,
             frame_counter=self.stats.frame_counter,
             camera_health=camera_health,
-            model_loaded=self.detector.loaded,
+            model_loaded=detector_health.loaded,
+            detector_healthy=detector_health.healthy,
+            detector_backend=detector_health.backend,
+            detector_classes_ok=detector_health.classes_ok,
+            detector_error=detector_health.last_error,
+            detector_latency_ms=self.stats.detector_latency_ms,
+            preprocess_ms=self.stats.preprocess_ms,
+            postprocess_ms=self.stats.postprocess_ms,
+            frames_skipped=self.stats.frames_skipped,
+            stale_frames_dropped=self.stats.stale_frames_dropped,
+            stale_results_dropped=self.stats.stale_results_dropped,
             odometry_fresh=pose_estimate.odometry_fresh,
             tag_pose_available=pose_estimate.tag_pose_available,
             tag_count=pose_estimate.tag_count,
@@ -503,20 +553,26 @@ class PerceptionApp:
         self._last_status_log = now
         health = self.cameras.health()
         cameras = " ".join(
-            f"{name}={'ok' if h.healthy else 'BAD'}@{h.fps:.0f}" for name, h in health.items()
+            f"{name}={'ok' if h.healthy else 'BAD'}@{h.fps:.0f}"
+            f"/{self.scheduler.stats_for(name).fps(now):.0f}"
+            for name, h in health.items()
         )
+        detector = self.detector.health()
         logger.info(
-            "status loop=%.1ffps %s alliance=%s pose=%s(%s) fuel=%d opp=%d "
-            "infer=%.0fms latency=%.0fms nav=%s",
-            self.stats.loop_fps, cameras, self.alliance.value,
+            "status loop=%.1ffps cam(capture/infer)=%s det=%s%s@%.0fms alliance=%s "
+            "pose=%s(%s) fuel=%d opp=%d skipped=%d stale=%d latency=%.0fms nav=%s",
+            self.stats.loop_fps, cameras, detector.backend,
+            "" if detector.healthy else "-DOWN", self.stats.detector_latency_ms,
+            self.alliance.value,
             "VALID" if pose_estimate.valid else "INVALID", pose_estimate.source.value,
             len(self.world.game_pieces(now)), len(self.world.obstacle_robots(now)),
-            self.stats.inference_ms, self.stats.perception_latency_ms, motion.reason,
+            self.stats.frames_skipped, self.stats.stale_results_dropped,
+            self.stats.perception_latency_ms, motion.reason,
         )
 
 
-def _range_one(detection, cam, ranging, known_width):
-    """Module-level so the lambda in ``_range_detections`` stays readable."""
+def _range_one(detection: Detection, cam, ranging, known_width):
+    """Range one detection.  Module level so the call site stays readable."""
     from .geometry import estimate_ground_object
 
     return estimate_ground_object(detection.bbox, cam, ranging, known_width)

@@ -100,7 +100,7 @@ class RangeRejection(Enum):
 class Frame:
     """One captured image plus everything needed to reason about its age."""
 
-    camera_name: str
+    camera_id: str
     seq: int
     #: ``time.monotonic()`` sampled immediately after the grab returned.
     timestamp: float
@@ -130,30 +130,111 @@ class CameraHealth:
 
 @dataclass
 class Detection:
-    """One YOLO box, still in pixels."""
+    """One detected object box, in pixels.
 
-    camera_name: str
-    frame_seq: int
-    timestamp: float
+    THIS IS THE HARDWARE BOUNDARY.  Every detector backend -- Hailo-8,
+    PyTorch, or whatever accelerator comes next -- produces exactly this
+    type, and nothing downstream of it knows or cares which one did.
+    Geometry, the world model and navigation see only ``Detection``.
+
+    ``camera_id`` and ``frame_sequence`` identify which frame this came
+    from, and ``capture_timestamp`` is when that frame was GRABBED, not
+    when inference finished.  Keeping the capture time attached is what
+    lets the pipeline reject a result that became stale while it waited
+    for the accelerator.
+    """
+
     class_name: str
     confidence: float
-    #: (x1, y1, x2, y2) in pixels, top-left origin.
-    bbox: Tuple[float, float, float, float]
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    camera_id: str
+    frame_sequence: int
+    capture_timestamp: float
+
+    @property
+    def bbox(self) -> Tuple[float, float, float, float]:
+        """(x1, y1, x2, y2) in pixels, top-left origin."""
+        return (self.x1, self.y1, self.x2, self.y2)
 
     @property
     def bottom_center(self) -> Tuple[float, float]:
-        x1, _y1, x2, y2 = self.bbox
-        return ((x1 + x2) * 0.5, y2)
+        return ((self.x1 + self.x2) * 0.5, self.y2)
 
     @property
     def pixel_width(self) -> float:
-        x1, _y1, x2, _y2 = self.bbox
-        return x2 - x1
+        return self.x2 - self.x1
 
     @property
     def pixel_height(self) -> float:
-        _x1, y1, _x2, y2 = self.bbox
-        return y2 - y1
+        return self.y2 - self.y1
+
+
+@dataclass
+class InferenceResult:
+    """One camera frame's detections, with the full timing chain attached.
+
+    The scheduler produces these; the application decides whether each is
+    young enough to act on.  Every timestamp is ``time.monotonic()``.
+    """
+
+    camera_id: str
+    frame_sequence: int
+    capture_timestamp: float
+    inference_start: float
+    inference_end: float
+    detections: List[Detection] = field(default_factory=list)
+    #: Frames this camera produced and the scheduler skipped to get here.
+    #: Skipping is correct -- an old frame is worthless on a moving robot --
+    #: but the count is published so the rate is visible.
+    skipped_frames: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+    @property
+    def inference_latency_s(self) -> float:
+        """Time the accelerator (plus pre/post-processing) actually took."""
+        return self.inference_end - self.inference_start
+
+    def result_age(self, now: float) -> float:
+        """How long ago inference FINISHED."""
+        return now - self.inference_end
+
+    def frame_age(self, now: float) -> float:
+        """End-to-end age: how old the underlying image is, right now.
+
+        This is the number that matters for a moving robot. It includes
+        capture, queueing, inference and everything since.
+        """
+        return now - self.capture_timestamp
+
+
+@dataclass
+class DetectorHealth:
+    """What the detector backend is currently able to do.
+
+    ``healthy`` False means NO new detections are being produced. It never
+    means "quietly switched to something slower": on the competition
+    machine a failed accelerator produces nothing, tracks age out, and
+    navigation degrades safely.
+    """
+
+    backend: str = "none"
+    loaded: bool = False
+    healthy: bool = False
+    classes_ok: bool = False
+    class_report: str = "not loaded"
+    model_path: str = ""
+    device_report: str = ""
+    last_error: str = ""
+    consecutive_failures: int = 0
+    inferences: int = 0
+    mean_latency_ms: float = 0.0
 
 
 @dataclass
@@ -184,7 +265,7 @@ class RangeResult:
 class RobotObservation:
     """A detection that has been successfully ranged, in the ROBOT frame."""
 
-    camera_name: str
+    camera_id: str
     timestamp: float
     class_name: str
     role: ObjectRole
@@ -200,7 +281,7 @@ class RobotObservation:
 class FieldObservation:
     """A ranged detection transformed into WPILib field coordinates."""
 
-    camera_name: str
+    camera_id: str
     timestamp: float
     class_name: str
     role: ObjectRole
@@ -250,7 +331,7 @@ class OdometryReading:
 class TagObservation:
     """One AprilTag seen by one camera, already solved to a robot pose."""
 
-    camera_name: str
+    camera_id: str
     timestamp: float
     tag_id: int
     #: Robot pose in field coordinates implied by this single tag.
@@ -454,11 +535,28 @@ class MechanismCommand:
 
 @dataclass
 class LoopStats:
-    """Rolling performance counters published for debugging."""
+    """Rolling performance counters published for debugging.
+
+    Every number here is MEASURED on the machine that is running. No
+    expected frame rate is assumed or hard-coded anywhere in this project.
+    """
 
     frame_counter: int = 0
     loop_fps: float = 0.0
+    #: End-to-end age of the oldest frame that contributed to this cycle.
     perception_latency_ms: float = 0.0
+    #: Wall time of the whole inference stage, all cameras.
     inference_ms: float = 0.0
+    #: Accelerator latency of the most recent single inference.
+    detector_latency_ms: float = 0.0
+    preprocess_ms: float = 0.0
+    postprocess_ms: float = 0.0
     apriltag_ms: float = 0.0
     publish_ms: float = 0.0
+    #: Frames refused by the freshness check before reaching the detector.
+    stale_frames_dropped: int = 0
+    #: Results that finished too late to be worth using.
+    stale_results_dropped: int = 0
+    #: Frames the scheduler skipped in favor of a newer one from the same
+    #: camera. Not an error -- this is the latest-frame policy working.
+    frames_skipped: int = 0

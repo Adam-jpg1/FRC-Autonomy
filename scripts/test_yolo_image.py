@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Run the trained model on one image (or a folder) and show what it found.
+"""Run a trained .pt model on an image (or folder) and show what it found.
+
+This is a TRAINING-SIDE tool: it loads PyTorch weights, not the deployed
+Hailo model. Use it to check a fresh ``best.pt`` before compiling it.
+For the deployed accelerator, use instead:
+
+    python scripts/test_hailo.py --model models/best_hailo_model --image x.jpg
+    python scripts/benchmark_detector.py --images data/samples/
 
     python scripts/test_yolo_image.py --model models/best.pt --image sample.jpg
     python scripts/test_yolo_image.py --model models/best.pt --image data/samples/ \
@@ -28,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2  # noqa: E402
 
 from frc_perception.config import EXPECTED_CLASS_NAMES, load_config  # noqa: E402
-from frc_perception.detector import compare_class_names, resolve_device  # noqa: E402
+from frc_perception.detector import compare_class_names, resolve_torch_device  # noqa: E402
 from frc_perception.geometry import estimate_ground_object  # noqa: E402
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
@@ -53,7 +60,7 @@ def gather_images(target: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", default="", help="weights path (default: config)")
+    parser.add_argument("--model", default="", help=".pt weights (default: config)")
     parser.add_argument("--image", required=True, help="image file, glob, or directory")
     parser.add_argument("--conf", type=float, default=None, help="override confidence threshold")
     parser.add_argument("--save-dir", default="", help="write annotated images here")
@@ -65,7 +72,7 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = load_config()
-    model_path = args.model or cfg.detector.model_path
+    model_path = args.model or cfg.detector.pytorch_model_path
     if not os.path.exists(model_path):
         print(f"FAIL: no weights at {model_path}")
         return 1
@@ -80,7 +87,7 @@ def main() -> int:
     names = {int(k): str(v) for k, v in dict(getattr(model, "names", {})).items()}
     ok, message = compare_class_names(names, EXPECTED_CLASS_NAMES)
     print(f"model   : {model_path}")
-    print(f"device  : {resolve_device(cfg.detector.device)}")
+    print(f"device  : {resolve_torch_device(cfg.detector.pytorch_device)}")
     print(f"classes : {names}")
     print(f"contract: {'OK' if ok else 'MISMATCH'} -- {message}")
     if not ok:

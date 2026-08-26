@@ -88,7 +88,7 @@ def test_every_key_is_published_every_cycle():
 
 
 def test_heartbeat_advances_even_while_disabled():
-    """A frozen heartbeat is how the RIO detects a dead Jetson, so it must
+    """A frozen heartbeat is how the RIO detects a dead Pi, so it must
     keep moving whether or not we are commanding anything."""
     controller = VirtualController(ControllerConfig(enabled=False))
     first = controller.update(None, 0.0, now=1.0).heartbeat

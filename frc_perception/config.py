@@ -1,5 +1,8 @@
 """Single source of truth for every tunable constant in the system.
 
+Target platform: Raspberry Pi 5 (8 GB) + Raspberry Pi AI HAT+ (Hailo-8,
+26 TOPS), two Arducam OV9782 USB cameras, roboRIO over NetworkTables 4.
+
 Nothing else in this package hard-codes a threshold, timeout, gain, gain
 weight, or physical dimension.  If you are tuning at a competition, tune
 here and nowhere else.
@@ -48,14 +51,20 @@ class CameraConfig:
     """
 
     name: str
-    # MUST INPUT: the /dev/videoN index for this camera. Run `ls /dev/video*`
-    # and `v4l2-ctl --list-devices` on the Jetson. USB cameras often expose
-    # two nodes each and can re-enumerate across boots -- pin them with a
-    # udev rule keyed on the USB port path before competition.
-    device_index: int = 0
-    #: Optional stable path, e.g. "/dev/v4l/by-path/...-index0". When set it
-    #: overrides device_index (recommended once you have a udev-stable path).
+    # MUST INPUT: a PERSISTENT device path for this camera. On Raspberry Pi
+    # OS, `ls -l /dev/v4l/by-id/` gives paths that survive reboots and
+    # re-plugging; `/dev/videoN` numbers do not, and two identical OV9782
+    # modules will happily swap places between boots. Each USB camera also
+    # claims two /dev/video nodes (the second is metadata), so pick the one
+    # `v4l2-ctl -d <path> --list-formats-ext` shows real formats for.
+    #
+    # If the two cameras are the same model with the same USB serial, by-id
+    # will not distinguish them -- use /dev/v4l/by-path/ instead, which is
+    # keyed on the physical USB port, and always plug each camera into the
+    # same port.
     device_path: str = ""
+    #: Fallback only, used when device_path is empty. Do NOT ship with this.
+    device_index: int = 0
 
     # OV9782 native sensor format is 1280x800 global shutter.
     width: int = 1280
@@ -133,8 +142,12 @@ class CameraConfig:
 
     @property
     def source(self) -> object:
-        """What to hand to ``cv2.VideoCapture``."""
+        """What to hand to ``cv2.VideoCapture``: persistent path if set."""
         return self.device_path if self.device_path else self.device_index
+
+    @property
+    def uses_persistent_path(self) -> bool:
+        return bool(self.device_path)
 
 
 # ===========================================================================
@@ -150,28 +163,70 @@ CLASS_BUMPER_RED = "bumper_red"
 
 EXPECTED_CLASS_NAMES: Tuple[str, ...] = (CLASS_FUEL, CLASS_BUMPER_BLUE, CLASS_BUMPER_RED)
 
+#: Coprocessors this project knows how to preflight.
+KNOWN_PLATFORMS: Tuple[str, ...] = ("raspberry_pi_5", "generic_linux")
+
+#: Detector backends implemented in detector.py.
+KNOWN_DETECTOR_BACKENDS: Tuple[str, ...] = ("hailo", "pytorch")
+
+#: Architectures the Ultralytics Hailo exporter accepts. The Raspberry Pi
+#: AI HAT+ 26 TOPS carries a Hailo-8; the 13 TOPS board carries a Hailo-8L.
+HAILO_ARCHITECTURES: Tuple[str, ...] = (
+    "hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l",
+)
+
 
 @dataclass
 class DetectorConfig:
-    # MUST INPUT: path to YOUR trained weights. Train with training/ and copy
-    # best.pt here. The file is intentionally not in git (see .gitignore).
-    model_path: str = "models/best.pt"
+    """Object detection: which backend, which artifact, which thresholds.
+
+    ``backend`` is the ONLY place inference hardware is chosen. There is no
+    automatic fallback: on the robot, a Hailo failure means no detections,
+    not a CPU model quietly eating the cores everything else needs.
+    """
+
+    #: "hailo"   -> Hailo-8 on the AI HAT+ (production)
+    #: "pytorch" -> Ultralytics .pt (DEVELOPMENT AND TESTING ONLY)
+    backend: str = "hailo"
+
+    # -- Hailo artifact ----------------------------------------------------
+    #: The Ultralytics Hailo export DIRECTORY, not just the .hef. The
+    #: metadata.yaml beside the .hef carries the class names, and
+    #: class-name routing has nothing to route on without it.
+    # MUST INPUT: build this on an x86_64 Linux machine with the Hailo
+    # Dataflow Compiler (see training/export_hailo.py) and copy the whole
+    # directory here. It cannot be compiled on the Pi.
+    hailo_model_path: str = "models/best_hailo_model"
+    #: Accelerator this artifact was compiled for. The Raspberry Pi AI HAT+
+    #: 26 TOPS carries a Hailo-8; the 13 TOPS version carries a Hailo-8L.
+    #: A binary built for one does not run on the other.
+    hailo_arch: str = "hailo8"
+
+    # -- PyTorch artifact (development only) -------------------------------
+    pytorch_model_path: str = "models/best.pt"
+    #: Torch device for the DEVELOPMENT backend. Never used in production.
+    pytorch_device: str = "auto"
+
     class_names: Tuple[str, ...] = EXPECTED_CLASS_NAMES
 
     conf_threshold: float = 0.40
     iou_threshold: float = 0.50
-    #: Inference letterbox size. 640 is a reasonable Orin Nano starting point.
+    #: Inference letterbox size. Must match the imgsz the HEF was compiled
+    #: at -- the Hailo input shape is fixed at compile time.
     imgsz: int = 640
-    #: "auto" resolves to cuda:0 when torch reports CUDA, else cpu.
-    device: str = "auto"
-    #: FP16. Ignored on CPU.
-    half: bool = True
     #: Hard cap on boxes per frame; protects the downstream stages from a
     #: pathological frame.
     max_detections: int = 60
+    #: Consecutive inference failures before the backend reports unhealthy.
+    failures_before_unhealthy: int = 5
 
     #: Per-class minimum confidence, applied on top of conf_threshold. Robot
     #: bumpers are usually easier than small distant game pieces.
+    #:
+    #: NOTE for Hailo detection exports: on-chip NMS bakes the EXPORT-time
+    #: confidence into nms_config.json, so the accelerator never returns a
+    #: box below it. These runtime values can only filter further. Export
+    #: low (see training/export_hailo.py) and tune here.
     per_class_conf: Dict[str, float] = field(
         default_factory=lambda: {
             CLASS_FUEL: 0.40,
@@ -190,6 +245,15 @@ class DetectorConfig:
     # to the camera, meters. Measure a real robot; bumper perimeter rules are
     # in the 2026 manual. Leave None to disable the cross-check for robots.
     bumper_width_m: Optional[float] = None
+
+    @property
+    def model_path(self) -> str:
+        """The artifact the selected backend will actually load."""
+        return (
+            self.hailo_model_path
+            if self.backend == "hailo"
+            else self.pytorch_model_path
+        )
 
 
 #: Class name -> semantic role BEFORE alliance is applied. Bumper classes
@@ -453,7 +517,7 @@ class NavigationConfig:
 class ControllerConfig:
     #: SAFETY DEFAULT. While False the adapter publishes a fully neutral
     #: gamepad and enabled=false. The roboRIO must ALSO gate on its own
-    #: deadman; the Jetson is never the last line of defense.
+    #: deadman; the coprocessor is never the last line of defense.
     enabled: bool = False
 
     #: True when your teleop drive code interprets the sticks as
@@ -498,7 +562,7 @@ class NetworkTablesConfig:
     #: Set to an explicit host/IP (e.g. "10.12.34.2" or "127.0.0.1") to skip
     #: team-number discovery. Useful with a desktop NT server for testing.
     server_override: str = ""
-    client_identity: str = "jetson-perception"
+    client_identity: str = "pi-perception"
     perception_table: str = "Perception"
     fms_table: str = "FMSInfo"
     key_is_red_alliance: str = "IsRedAlliance"
@@ -526,14 +590,26 @@ class LoggingConfig:
 class AppConfig:
     """The whole configuration.  Build it with :func:`load_config`."""
 
+    #: Coprocessor this configuration targets. Used by run.py --check to
+    #: decide which platform preflight to run and to refuse a development
+    #: detector backend on the competition machine.
+    platform: str = "raspberry_pi_5"
+
     #: Main loop target rate. The loop never runs faster than this.
     loop_hz: float = 30.0
-    #: A frame older than this is refused: a frozen camera must never feed
-    #: the same stale image into YOLO forever.
+    #: A frame older than this is refused before it reaches the accelerator:
+    #: a frozen camera must never feed the detector the same image forever.
     frame_freshness_s: float = 0.25
-    #: End-to-end age above which a completed inference result is dropped
-    #: instead of published.
-    max_result_age_s: float = 0.40
+    #: End-to-end age (capture -> now) above which a finished inference
+    #: result is DISCARDED instead of entering the world model. A correct
+    #: answer about where objects were 400 ms ago is a wrong answer about
+    #: where they are.
+    max_detection_result_age_s: float = 0.40
+    #: How many cameras the scheduler may run inference on per loop cycle.
+    #: With one accelerator and two cameras, 2 means "both, newest frame
+    #: each"; drop to 1 to halve accelerator load at the cost of per-camera
+    #: rate. The scheduler is round-robin, so 1 still alternates fairly.
+    max_inferences_per_cycle: int = 2
     #: Consecutive failures of one pipeline stage before it is reported as
     #: a hard error rather than a rate-limited warning.
     stage_failure_alarm_count: int = 10
@@ -578,7 +654,14 @@ def load_config() -> AppConfig:
         cameras=[
             CameraConfig(
                 name="cam0",
-                device_index=0,   # MUST INPUT: verify with `ls /dev/video*`
+                # MUST INPUT: the persistent path for this camera. Find it with
+                #   ls -l /dev/v4l/by-id/
+                # and confirm with
+                #   v4l2-ctl -d <path> --list-formats-ext
+                # Leaving this empty falls back to device_index, which is not
+                # safe across reboots.
+                device_path="",
+                device_index=0,
                 # MUST INPUT: every mount value below must be measured on the
                 # real robot. They are left at zero on purpose so that an
                 # unmeasured camera produces obviously wrong numbers during
@@ -592,7 +675,8 @@ def load_config() -> AppConfig:
             ),
             CameraConfig(
                 name="cam1",
-                device_index=2,   # MUST INPUT: verify with `ls /dev/video*` (each USB camera often claims two nodes)
+                device_path="",   # MUST INPUT: see cam0
+                device_index=2,   # each USB camera often claims two /dev/video nodes
                 mount_x_m=0.0,    # MUST INPUT: measure on the robot
                 mount_y_m=0.0,    # MUST INPUT: measure on the robot
                 mount_z_m=0.0,    # MUST INPUT: measure on the robot
@@ -652,6 +736,13 @@ def validate_config(cfg: AppConfig) -> List[ConfigIssue]:
 
     for cam in cfg.enabled_cameras:
         where = f"cameras[{cam.name}]"
+        if not cam.uses_persistent_path:
+            must(
+                where + ".device_path",
+                "set a persistent path from `ls -l /dev/v4l/by-id/` (or by-path); "
+                "/dev/videoN numbers change across reboots and the two cameras "
+                "will eventually swap",
+            )
         if cam.width <= 0 or cam.height <= 0 or cam.fps <= 0:
             fail(where, "width/height/fps must be positive")
         if not cam.has_calibrated_intrinsics:
@@ -672,6 +763,35 @@ def validate_config(cfg: AppConfig) -> List[ConfigIssue]:
             warn(where + ".distance_poly", "no empirical distance correction fitted yet (run scripts/calibrate_distance.py)")
         if not (0.0 <= cam.usable_bottom_min_frac < cam.usable_bottom_max_frac <= 1.0):
             fail(where, "usable image fractions must satisfy 0 <= min < max <= 1")
+
+    # -- Platform / detector backend ---------------------------------------
+    if cfg.platform not in KNOWN_PLATFORMS:
+        warn("platform", f"unrecognized platform {cfg.platform!r}; expected one of {sorted(KNOWN_PLATFORMS)}")
+    if cfg.detector.backend not in KNOWN_DETECTOR_BACKENDS:
+        fail("detector.backend", f"unknown backend {cfg.detector.backend!r}; expected one of {sorted(KNOWN_DETECTOR_BACKENDS)}")
+    elif cfg.detector.backend == "pytorch" and cfg.platform == "raspberry_pi_5":
+        warn(
+            "detector.backend",
+            "the PyTorch backend is selected on the Raspberry Pi. It is a "
+            "DEVELOPMENT backend: running YOLO on the Pi's CPU starves capture, "
+            "AprilTags and the main loop. Use backend='hailo' for competition.",
+        )
+    if cfg.detector.backend == "hailo" and cfg.detector.hailo_arch not in HAILO_ARCHITECTURES:
+        fail(
+            "detector.hailo_arch",
+            f"{cfg.detector.hailo_arch!r} is not a Hailo architecture; expected one of "
+            f"{sorted(HAILO_ARCHITECTURES)} (the AI HAT+ 26 TOPS is 'hailo8')",
+        )
+    if cfg.max_inferences_per_cycle < 1:
+        fail("max_inferences_per_cycle", "must be at least 1")
+    if cfg.max_detection_result_age_s <= 0:
+        fail("max_detection_result_age_s", "must be positive")
+    if cfg.max_detection_result_age_s < cfg.frame_freshness_s:
+        warn(
+            "max_detection_result_age_s",
+            "is below frame_freshness_s, so a frame that passed the freshness "
+            "check can never survive inference; results will always be dropped",
+        )
 
     # -- Detector -----------------------------------------------------------
     det = cfg.detector
@@ -733,7 +853,7 @@ def validate_config(cfg: AppConfig) -> List[ConfigIssue]:
     # -- Controller ---------------------------------------------------------
     ctl = cfg.controller
     if ctl.enabled:
-        warn("controller.enabled", "VIRTUAL CONTROLLER IS ENABLED -- the Jetson will publish live stick commands")
+        warn("controller.enabled", "VIRTUAL CONTROLLER IS ENABLED -- the Pi will publish live stick commands")
     if not (0.0 < ctl.output_limit <= 1.0):
         fail("controller.output_limit", "must be in (0,1]")
     if not (0.0 <= ctl.deadband < 1.0):
@@ -755,6 +875,8 @@ def validate_config(cfg: AppConfig) -> List[ConfigIssue]:
 def config_summary(cfg: AppConfig) -> str:
     """One-screen human summary, printed at startup and by --check."""
     lines = [
+        f"platform={cfg.platform} detector={cfg.detector.backend}"
+        + (f" ({cfg.detector.hailo_arch})" if cfg.detector.backend == "hailo" else ""),
         f"team={cfg.networktables.team_number or '(unset)'} "
         f"server={cfg.networktables.server_override or 'auto'} loop={cfg.loop_hz:g}Hz",
         f"model={cfg.detector.model_path} classes={tuple(cfg.detector.class_names)}",
@@ -787,6 +909,9 @@ __all__ = [
     "ControllerConfig",
     "DetectorConfig",
     "EXPECTED_CLASS_NAMES",
+    "HAILO_ARCHITECTURES",
+    "KNOWN_DETECTOR_BACKENDS",
+    "KNOWN_PLATFORMS",
     "LocalizationConfig",
     "LoggingConfig",
     "NavigationConfig",

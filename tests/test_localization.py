@@ -395,7 +395,7 @@ def test_tag_solve_recovers_a_rotated_robot_pose():
 
 def observation(tag_id, x, y, theta=0.0, distance=2.0) -> TagObservation:
     return TagObservation(
-        camera_name="cam0", timestamp=1.0, tag_id=tag_id,
+        camera_id="cam0", timestamp=1.0, tag_id=tag_id,
         robot_pose=Pose2d(x, y, theta), distance_m=distance,
         decision_margin=60.0, hamming=0,
     )

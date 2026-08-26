@@ -1,54 +1,71 @@
-# Python dependencies for the FRC 2026 Jetson perception system.
+# Python dependencies for the FRC 2026 perception system.
+# Target platform: Raspberry Pi 5 (8 GB) + Raspberry Pi AI HAT+ (Hailo-8).
 #
 # ===========================================================================
-# READ THIS BEFORE RUNNING `pip install -r requirements.txt` ON THE JETSON
+# THREE SEPARATE DEPENDENCY SETS -- do not mix them up
 # ===========================================================================
 #
-# TORCH / CUDA
-#   `ultralytics` depends on `torch`. The torch wheels on PyPI for aarch64
-#   are CPU-ONLY. Installing them on a Jetson gives you a working import and
-#   roughly 10x less performance, with no error to tell you why.
+#   1. APT / SYSTEM (Raspberry Pi, robot)      -- NOT in this file
+#        sudo apt install dkms hailo-all
+#        sudo reboot
+#        hailortcli fw-control identify
+#      `hailo-all` installs the PCIe driver, HailoRT, and the
+#      `hailo_platform` Python bindings into the system Python. It is a
+#      kernel-coupled system package: pip must never try to manage it, and
+#      it is deliberately absent from this file.
 #
-#   On the Jetson Orin Nano:
-#     1. FIRST install NVIDIA's CUDA-enabled torch/torchvision wheels for
-#        your exact JetPack version (NVIDIA's "PyTorch for Jetson" resources).
-#     2. Verify:  python3 -c "import torch; print(torch.cuda.is_available())"
-#        This must print True before you continue.
-#     3. THEN install ultralytics without letting pip replace torch:
-#          pip3 install ultralytics --no-deps
-#          pip3 install -r requirements.txt --no-deps
-#        and fill any remaining gaps by hand.
+#   2. PYTHON RUNTIME (this file)              -- robot and development
+#      Everything the application itself imports.
 #
-#   If you already have a working CUDA torch, do NOT let anything upgrade it.
-#   Re-verify torch.cuda.is_available() after every pip install.
+#   3. MODEL COMPILATION (x86_64 Linux only)   -- NOT in this file
+#      The Hailo Dataflow Compiler (`hailo_sdk_client`) plus TensorFlow.
+#      A registered download from the Hailo Developer Zone, not on PyPI.
+#      The Raspberry Pi never compiles a model; see training/export_hailo.py.
 #
-# OPENCV
-#   JetPack ships a system OpenCV. If `import cv2` already works on the
-#   Jetson, do NOT pip-install opencv-python over it -- the pip wheel is a
-#   CPU-only build and will shadow the system one. The marker below skips
-#   the pip wheel on aarch64 for exactly that reason.
+# ---------------------------------------------------------------------------
+# NOTES FOR THE RASPBERRY PI
+# ---------------------------------------------------------------------------
+# * Use a venv created with --system-site-packages so the apt-installed
+#   `hailo_platform` bindings remain importable:
+#       python3 -m venv --system-site-packages ~/frcvenv
 #
-# PUPIL-APRILTAGS
-#   Builds native code on ARM. Install build tools first:
-#     sudo apt install cmake build-essential
+# * `ultralytics` pulls in `torch`. On the Pi that is the CPU build, and
+#   that is FINE: production inference runs on the Hailo-8, and torch is only
+#   along for the ride as an Ultralytics dependency. Do not go looking for a
+#   GPU build -- the Pi has no CUDA and does not need any.
+#   If disk or install time matters, `pip install ultralytics --no-deps` and
+#   add only what is actually imported.
 #
-# On a laptop (PyCharm, hardware-free development) plain
-# `pip install -r requirements.txt` is fine.
+# * OpenCV: Raspberry Pi OS ships python3-opencv. If `import cv2` already
+#   works, prefer it (`sudo apt install python3-opencv`) over the pip wheel.
+#   The marker below keeps pip from installing a second copy on ARM.
+#
+# * pupil-apriltags builds native code on ARM:
+#       sudo apt install cmake build-essential
+#
+# * The cameras are USB/UVC. Picamera2 and the libcamera stack are NOT used
+#   and are not required.
 # ===========================================================================
 
 numpy>=1.23
 
-# Skipped on aarch64: use the JetPack system OpenCV instead (see above).
+# Skipped on ARM: prefer the distro OpenCV (sudo apt install python3-opencv).
 opencv-python>=4.8; platform_machine != "aarch64"
 
-# YOLO. On the Jetson install this with --no-deps AFTER NVIDIA's torch.
-ultralytics>=8.1
+# Reads the Hailo export metadata.yaml (class names) and the training config.
+PyYAML>=6.0
 
-# AprilTag detection. Needs cmake to build on ARM.
+# Model loading and inference. On the Pi this drives the Hailo-8 through
+# Ultralytics' HailoBackend; on a laptop it runs the .pt development backend.
+ultralytics>=8.4
+
+# AprilTag detection. Runs on the Pi CPU. Needs cmake to build on ARM.
 pupil-apriltags>=1.0.4
 
 # NetworkTables 4 client. Import name is `ntcore`.
 pyntcore>=2024.1
 
 # --- development / testing only --------------------------------------------
+# The unit suite needs only numpy, PyYAML and pytest. It does not require
+# HailoRT, an accelerator, Ultralytics, or torch.
 pytest>=7.0

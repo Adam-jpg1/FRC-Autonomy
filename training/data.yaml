@@ -1,4 +1,4 @@
-# Ultralytics dataset descriptor for the FRC 2026 Jetson perception model.
+# Ultralytics dataset descriptor for the FRC 2026 perception model.
 #
 # The class NAMES here are a hard contract with the runtime: every routing
 # decision in frc_perception/ is made by name, never by index. Renaming a
