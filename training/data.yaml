@@ -1,0 +1,24 @@
+# Ultralytics dataset descriptor for the FRC 2026 Jetson perception model.
+#
+# The class NAMES here are a hard contract with the runtime: every routing
+# decision in frc_perception/ is made by name, never by index. Renaming a
+# class here without renaming it in frc_perception/config.py makes that
+# class invisible at runtime -- the model detects it and the pipeline
+# throws it away. Do not rename them.
+#
+# `path` is the dataset root. On Colab this is usually something like
+#   /content/dataset
+# and on a workstation it is wherever you unzipped the dataset.
+# MUST INPUT: set `path` to your dataset root before training.
+
+path: ../dataset
+train: images/train
+val: images/val
+test: images/test
+
+# Class indices are assigned by ORDER in this list. Keep the order stable
+# across retrains so old label files stay valid.
+names:
+  0: fuel
+  1: bumper_blue
+  2: bumper_red

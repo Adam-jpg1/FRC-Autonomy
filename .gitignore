@@ -1,8 +1,35 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .pytest_cache/
+.venv/
+venv/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Runtime output
 logs/
+!logs/.gitkeep
+
+# Trained weights and exports (large binaries, rebuilt per season)
 models/*.pt
 models/*.engine
 models/*.onnx
+models/*.torchscript
+
+# Downloaded / generated data
 data/field_layout.json
+data/calibration/
+data/distance/
+data/snapshots/
+data/samples/
+data/clips/
+data/predictions/
+
+# Training artifacts
+runs/
+dataset/

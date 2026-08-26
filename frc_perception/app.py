@@ -1,218 +1,525 @@
-"""Main application: wires cameras -> detector/tags -> world -> nav -> NT.
+"""The application: wires the layers together and runs the main loop.
 
-Design rule: one subsystem failing (a camera unplugged, a bad tag solve,
-a model hiccup) logs and degrades — it never kills the loop. The only
-things that stop the loop are SIGINT/SIGTERM.
+Layer order, top to bottom.  Each layer only depends on the ones above
+it, and a failure in a lower layer never corrupts a higher one:
+
+    cameras -> detection -> robot-relative geometry -> localization
+    -> field transform -> world model -> navigation -> virtual controller
+    -> NetworkTables -> (roboRIO safety gate)
+
+RESILIENCE
+----------
+Every stage runs inside :meth:`PerceptionApp._stage`, which contains the
+exception, counts consecutive failures, rate-limits the log, and escalates
+to an ERROR once a stage has failed repeatedly.  One dead camera, one
+AprilTag hiccup, or one bad inference does not stop the others -- but a
+stage that keeps failing is never silently ignored.
+
+TWO RULES THAT MATTER MORE THAN THE REST
+----------------------------------------
+* Detections are only transformed into field coordinates while the pose
+  is VALID.  With a bad pose those transforms are fiction, so the world
+  model is cleared instead of being poisoned with phantom objects.
+* Frames are pulled with :meth:`FrameSource.read_fresh`.  A frozen camera
+  yields nothing rather than feeding a stale image to YOLO.
 """
 
+from __future__ import annotations
+
 import logging
+import math
 import signal
 import time
-from typing import List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .camera import CameraWorker
-from .config import AppConfig, CameraConfig
-from .detector import Detection, Detector
-from .field_map import FieldMap
-from .geometry import estimate_object_position, robot_to_field
-from .localization import OdometryTracker, PoseFuser, TagLocalizer
-from .navigation import Navigator
-from .nt_io import NTInterface
+from .alliance import alliance_from_is_red, is_obstacle, role_for_class
+from .apriltag_locator import AprilTagLocalizer, to_grayscale
+from .camera import CameraManager, build_camera_manager
+from .config import AppConfig, CLASS_FUEL
+from .detector import YoloDetector
+from .field_map import try_load_field_map
+from .geometry import robot_to_field
+from .localization import PoseEstimator
+from .logging_setup import RateLimiter, StateLogger
+from .navigation import FieldBounds, Navigator, filter_usable_tracks
+from .nt_io import NTBackend, NetworkTablesIO, build_perception_payload
+from .types import (
+    Alliance,
+    DesiredMotion,
+    FieldObservation,
+    LoopStats,
+    ObjectRole,
+    Pose2d,
+    RobotObservation,
+    TagObservation,
+)
 from .virtual_controller import VirtualController
-from .world_model import FieldDetection, WorldModel, positions
+from .world_model import WorldModel
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class PerceptionApp:
-    def __init__(self, cfg: AppConfig):
+    """Owns every subsystem and drives one perception cycle at a time."""
+
+    def __init__(
+        self,
+        cfg: AppConfig,
+        nt: Optional[NTBackend] = None,
+        replay_paths: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.cfg = cfg
-        self.field_map = FieldMap(
-            cfg.localization.field_layout_path,
-            cfg.localization.fallback_field_length_m,
-            cfg.localization.fallback_field_width_m,
+        self.stats = LoopStats()
+        self._running = False
+        self._stop_requested = False
+
+        self._rate_limiter = RateLimiter(cfg.logging.rate_limit_s)
+        self._states = StateLogger(logger)
+        self._stage_failures: Dict[str, int] = {}
+
+        # -- layers ---------------------------------------------------------
+        self.cameras: CameraManager = build_camera_manager(
+            cfg.cameras, cfg.frame_freshness_s, replay_paths
         )
-        self.nt = NTInterface(cfg)
-        self.cameras = [CameraWorker(c) for c in cfg.cameras]
-        self.detector = Detector(cfg.detector)
-        self.tag_localizer = TagLocalizer(cfg.localization, self.field_map, cfg.cameras)
-        self.odom = OdometryTracker(cfg.localization.odom_stale_s)
-        self.fuser = PoseFuser(cfg.localization)
+        self.detector = YoloDetector(cfg.detector)
+
+        self.field_map, field_map_error = try_load_field_map(
+            cfg.localization.apriltag.field_layout_path
+        )
+        if self.field_map is None:
+            logger.error(
+                "field layout unavailable (%s); AprilTag localization is DISABLED",
+                field_map_error,
+            )
+
+        self.apriltags = AprilTagLocalizer(cfg.localization.apriltag, self.field_map)
+        self.estimator = PoseEstimator(cfg.localization, self.field_map)
         self.world = WorldModel(cfg.world_model, self.field_map)
-        self.navigator = Navigator(cfg.nav, self.field_map)
+        self.navigator = Navigator(cfg.navigation, FieldBounds.from_field_map(self.field_map))
         self.controller = VirtualController(cfg.controller)
+        self.nt: NTBackend = nt if nt is not None else NetworkTablesIO(cfg.networktables)
 
-        self._running = False
-        self._frame_counter = 0
+        self.alliance = Alliance.UNKNOWN
+        self._loop_times: List[float] = []
         self._last_status_log = 0.0
-        self._error_log_times = {}  # stage name -> last log time (rate limiting)
+        self._apriltag_cycle = 0
+        self._camera_order = [cam.name for cam in cfg.cameras]
+        self._camera_by_name = {cam.name: cam for cam in cfg.cameras}
+        self._cameras_seen_healthy: set = set()
 
-        if cfg.controller.enabled:
-            log.warning("VIRTUAL CONTROLLER IS ENABLED — the robot may drive itself")
-        else:
-            log.info("virtual controller disabled (ControllerConfig.enabled=False)")
+    # -- lifecycle ---------------------------------------------------------
 
-    # -- lifecycle ---------------------------------------------------------------
-
-    def run(self) -> None:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, self._handle_signal)
-        for cam in self.cameras:
-            cam.start()
+    def start(self) -> None:
+        logger.info("starting perception app")
+        self.cameras.start()
+        self.detector.load()
+        self.apriltags.load()
+        self.nt.connect()
         self._running = True
-        period = 1.0 / self.cfg.loop_hz
-        log.info("perception loop starting at %.0f Hz target", self.cfg.loop_hz)
-        while self._running:
-            start = time.monotonic()
-            try:
-                self._cycle(start)
-            except Exception:
-                log.exception("unhandled error in perception cycle")
-            elapsed = time.monotonic() - start
-            if elapsed < period:
-                time.sleep(period - elapsed)
-        self._shutdown()
 
-    def _handle_signal(self, signum, _frame) -> None:
-        log.info("signal %d received, shutting down", signum)
+    def stop(self) -> None:
+        logger.info("stopping perception app")
         self._running = False
-
-    def _shutdown(self) -> None:
-        # Publish a final, safe controller state before exiting.
+        self.cameras.stop()
         try:
-            from .virtual_controller import GamepadState
-            self.nt.publish_controller(GamepadState(enabled=False))
-        except Exception:
-            pass
-        for cam in self.cameras:
-            cam.stop()
+            # Leave the gamepad in a known-neutral state on the way out.
+            self.nt.publish_controller(self.controller.neutral())
+        except Exception as exc:  # noqa: BLE001 - shutdown is best effort
+            logger.warning("could not publish neutral controller state: %s", exc)
         self.nt.close()
-        log.info("shutdown complete")
 
-    # -- one cycle -----------------------------------------------------------------
+    def request_stop(self, *_args: Any) -> None:
+        self._stop_requested = True
 
-    def _cycle(self, now: float) -> None:
-        # 1. Odometry in (staleness judged by RIO timestamp advancing).
-        odom_sample = self.nt.get_odometry()
-        if odom_sample is not None:
-            x, y, theta, rio_ts = odom_sample
-            self.odom.update(x, y, theta, rio_ts, now)
+    def install_signal_handlers(self) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, self.request_stop)
+            except (ValueError, OSError):  # pragma: no cover - non-main thread
+                pass
 
-        # 2. Fresh frames only. A frozen camera contributes nothing.
-        frames: List[Tuple[CameraConfig, object]] = []
-        for cam in self.cameras:
-            got = cam.get_frame(self.cfg.frame_freshness_s)
-            if got is not None:
-                frames.append((cam.cfg, got[0]))
+    # -- error containment -------------------------------------------------
 
-        # 3. AprilTag localization (decimated if configured).
-        if frames and self.tag_localizer.enabled and (
-            self._frame_counter % self.cfg.apriltag_every_n_frames == 0
-        ):
-            self._run_tags(frames, now)
+    def _stage(self, name: str, function: Callable[[], Any], default: Any = None) -> Any:
+        """Run one pipeline stage, containing and counting its failures."""
+        try:
+            result = function()
+        except Exception as exc:  # noqa: BLE001 - that is the entire point
+            failures = self._stage_failures.get(name, 0) + 1
+            self._stage_failures[name] = failures
+            level = (
+                logging.ERROR
+                if failures >= self.cfg.stage_failure_alarm_count
+                else logging.WARNING
+            )
+            self._rate_limiter.log(
+                logger, level, f"stage:{name}",
+                "stage %s failed (%d consecutive): %s", name, failures, exc,
+            )
+            return default
+        if self._stage_failures.get(name):
+            logger.info("stage %s recovered after %d failures", name, self._stage_failures[name])
+            self._stage_failures[name] = 0
+        return result
 
-        # 4. Current best pose.
-        pose = self.fuser.estimate(self.odom, now)
+    # -- the loop ----------------------------------------------------------
 
-        # 5. Object detection + ranging, all cameras batched.
-        field_detections = self._run_detection(frames, pose)
+    def run(self) -> int:
+        """Run until interrupted.  Returns a process exit code."""
+        self.start()
+        period = 1.0 / self.cfg.loop_hz
+        try:
+            while not self._stop_requested:
+                started = time.monotonic()
+                self.step(started)
+                elapsed = time.monotonic() - started
+                if elapsed < period:
+                    time.sleep(period - elapsed)
+        except KeyboardInterrupt:
+            logger.info("interrupted")
+        finally:
+            self.stop()
+        return 0
 
-        # 6. World model: only update with a valid pose; always prune.
-        if pose.valid:
-            self.world.update(field_detections, now)
-        else:
-            self.world.prune(now)
+    def step(self, now: Optional[float] = None) -> None:
+        """One full perception cycle.  Safe to call from a test."""
+        moment = time.monotonic() if now is None else now
+        self.stats.frame_counter += 1
 
-        # 7. Role/alliance routing.
-        is_red = self.nt.is_red_alliance()
-        balls = self.world.game_pieces()
-        opponents = self.world.opponents(is_red)
+        frames = self._stage("capture", lambda: self.cameras.fresh_frames(moment), {}) or {}
+        self._log_camera_health()
 
-        # 8. Navigate (degrades internally on invalid pose).
-        nav = self.navigator.update(pose, balls, opponents)
+        self._stage("nt_poll", self._poll_connection)
+        self._stage("alliance", lambda: self._update_alliance(moment))
+        self._stage("odometry", lambda: self._update_odometry(moment))
 
-        # 9. Publish gamepad + perception.
-        self.nt.publish_controller(self.controller.build(nav, pose, balls, now))
-        self._frame_counter += 1
-        self.nt.publish_perception(
-            positions(balls),
-            positions(opponents),
-            pose.x, pose.y, pose.theta, pose.valid,
-            self._frame_counter,
+        apriltag_started = time.monotonic()
+        tag_observations = self._stage(
+            "apriltags", lambda: self._detect_tags(frames, moment), []
+        ) or []
+        self.stats.apriltag_ms = (time.monotonic() - apriltag_started) * 1000.0
+        self._stage("tag_fusion", lambda: self._fuse_tags(tag_observations, moment))
+
+        pose_estimate = self.estimator.update(moment)
+
+        inference_started = time.monotonic()
+        robot_observations = self._stage(
+            "detect", lambda: self._detect_objects(frames, moment), []
+        ) or []
+        self.stats.inference_ms = (time.monotonic() - inference_started) * 1000.0
+
+        self._stage(
+            "world_model",
+            lambda: self._update_world(robot_observations, pose_estimate, moment),
         )
 
-        # 10. Periodic status line.
-        if now - self._last_status_log >= self.cfg.status_log_period_s:
-            self._last_status_log = now
-            ages = ", ".join(
-                f"{c.cfg.name}={c.age_s:.2f}s" if c.age_s != float("inf")
-                else f"{c.cfg.name}=NONE"
-                for c in self.cameras
+        motion = self._stage(
+            "navigation", lambda: self._navigate(pose_estimate, moment),
+            DesiredMotion.stopped("navigation stage failed"),
+        )
+        if motion is None:
+            motion = DesiredMotion.stopped("navigation returned nothing")
+
+        controller_state = self._stage(
+            "controller",
+            lambda: self.controller.update(
+                motion, pose_estimate.pose.theta, moment, pose_estimate.valid
+            ),
+            self.controller.neutral(),
+        )
+
+        publish_started = time.monotonic()
+        self._stage(
+            "publish",
+            lambda: self._publish(frames, pose_estimate, motion, controller_state, moment),
+        )
+        self.stats.publish_ms = (time.monotonic() - publish_started) * 1000.0
+
+        self._update_loop_stats(moment)
+        self._periodic_status(moment, pose_estimate, motion)
+
+    # -- stages ------------------------------------------------------------
+
+    def _poll_connection(self) -> None:
+        poll = getattr(self.nt, "poll_connection", None)
+        connected = poll() if callable(poll) else self.nt.connected
+        self._states.log(
+            "nt_connected", connected,
+            "NetworkTables connected", "NetworkTables DISCONNECTED",
+        )
+
+    def _update_alliance(self, now: float) -> None:
+        alliance = alliance_from_is_red(self.nt.read_is_red_alliance())
+        if alliance is not self.alliance:
+            logger.info("alliance: %s -> %s", self.alliance.value, alliance.value)
+            self.alliance = alliance
+        if alliance is Alliance.UNKNOWN:
+            self._rate_limiter.log(
+                logger, logging.WARNING, "alliance_unknown",
+                "alliance UNKNOWN (FMSInfo/IsRedAlliance not available); every robot "
+                "detection is treated as an obstacle",
+                now=now,
             )
-            log.info(
-                "pose=(%.2f, %.2f, %.1f°) %s src=%s | balls=%d opp=%d | nav=%s | "
-                "cams[%s] | nt=%s",
-                pose.x, pose.y, pose.theta * 57.2958,
-                "VALID" if pose.valid else "INVALID", pose.source,
-                len(balls), len(opponents), nav.state, ages,
-                "up" if self.nt.connected else "DOWN",
-            )
 
-    # -- stages ---------------------------------------------------------------------
+    def _update_odometry(self, now: float) -> None:
+        reading = self.nt.read_odometry()
+        if reading is None:
+            return
+        x, y, theta, rio_timestamp = reading
+        self.estimator.update_odometry(Pose2d(x, y, theta), rio_timestamp, now)
 
-    def _run_tags(self, frames, now: float) -> None:
-        try:
-            import cv2
-
-            fixes = []
-            for cam_cfg, frame in frames:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                fixes.extend(self.tag_localizer.process(gray, cam_cfg))
-            combined = self.tag_localizer.combine(fixes)
-            if combined is not None:
-                self.fuser.update_from_tag(combined, self.odom, now)
-        except Exception:
-            self._log_stage_error("apriltag", now)
-
-    def _run_detection(self, frames, pose) -> List[FieldDetection]:
-        if not frames:
+    def _detect_tags(self, frames: Dict[str, Any], now: float) -> List[TagObservation]:
+        if not self.apriltags.available:
             return []
-        try:
-            batches = self.detector.detect_batch([f for _, f in frames])
-        except Exception:
-            self._log_stage_error("yolo", time.monotonic())
+        self._apriltag_cycle += 1
+        every = max(1, self.cfg.localization.apriltag.detect_every_n_frames)
+        if self._apriltag_cycle % every != 0:
             return []
-        out: List[FieldDetection] = []
-        for (cam_cfg, _), detections in zip(frames, batches):
-            for det in detections:
-                est = self._range_detection(det, cam_cfg)
-                if est is None:
-                    continue
-                if not pose.valid:
-                    continue  # nothing to project onto without a pose
-                fx, fy = robot_to_field(est.x, est.y, pose.x, pose.y, pose.theta)
-                out.append(
-                    FieldDetection(det.class_name, det.role, fx, fy, det.confidence)
+
+        observations: List[TagObservation] = []
+        for name, frame in frames.items():
+            cam = self._camera_by_name.get(name)
+            if cam is None or not cam.use_for_apriltags:
+                continue
+            try:
+                gray = to_grayscale(frame.image)
+                observations.extend(self.apriltags.detect_frame(gray, cam, frame.timestamp))
+            except Exception as exc:  # noqa: BLE001 - one camera must not stop the other
+                self._rate_limiter.log(
+                    logger, logging.WARNING, f"apriltag:{name}",
+                    "apriltag detection failed on %s: %s", name, exc, now=now,
                 )
-        return out
+        return observations
 
-    def _range_detection(self, det: Detection, cam_cfg: CameraConfig):
-        known_width = (
-            self.cfg.detector.fuel_diameter_m
-            if det.class_name == "fuel"
-            else self.cfg.detector.bumper_width_m
-        )
-        est = estimate_object_position(det.bbox_xyxy, cam_cfg, known_width)
-        if est is not None and not est.cross_check_ok:
-            log.debug(
-                "%s on %s: width range %.2f m disagrees with ground range %.2f m",
-                det.class_name, cam_cfg.name,
-                est.width_distance_m or -1.0, est.ground_distance_m,
+    def _fuse_tags(self, observations: Sequence[TagObservation], now: float) -> None:
+        estimate = self.apriltags.estimate(observations, now)
+        if estimate is not None:
+            self.estimator.add_tag_estimate(estimate, now)
+
+    def _detect_objects(self, frames: Dict[str, Any], now: float) -> List[RobotObservation]:
+        if not self.detector.loaded:
+            self._rate_limiter.log(
+                logger, logging.WARNING, "model_missing",
+                "YOLO model not loaded (%s); no object detection",
+                self.detector.load_error or "unknown reason", now=now,
             )
-        return est
+            return []
 
-    def _log_stage_error(self, stage: str, now: float) -> None:
-        """Log one traceback per stage per 5 s so a hard failure can't spam."""
-        if now - self._error_log_times.get(stage, 0.0) >= 5.0:
-            self._error_log_times[stage] = now
-            log.exception("stage '%s' failed (rate-limited log)", stage)
+        observations: List[RobotObservation] = []
+        for name, frame in frames.items():
+            cam = self._camera_by_name.get(name)
+            if cam is None or not cam.use_for_objects:
+                continue
+            try:
+                detections = self.detector.detect(frame)
+            except Exception as exc:  # noqa: BLE001 - contained per camera
+                self._rate_limiter.log(
+                    logger, logging.WARNING, f"infer:{name}",
+                    "inference failed on %s: %s", name, exc, now=now,
+                )
+                continue
+
+            age = time.monotonic() - frame.timestamp
+            if age > self.cfg.max_result_age_s:
+                # The answer is correct but no longer describes the present.
+                self._rate_limiter.log(
+                    logger, logging.WARNING, f"stale_result:{name}",
+                    "dropping %s result: %.0f ms old (limit %.0f ms)",
+                    name, age * 1000.0, self.cfg.max_result_age_s * 1000.0, now=now,
+                )
+                continue
+
+            observations.extend(self._range_detections(detections, cam))
+        return observations
+
+    def _range_detections(self, detections, cam) -> List[RobotObservation]:
+        results: List[RobotObservation] = []
+        for detection in detections:
+            role = role_for_class(detection.class_name, self.alliance)
+            if role is ObjectRole.FRIENDLY:
+                # Positively identified teammate: never an obstacle, and never
+                # counted as an opponent. Dropped here on purpose.
+                continue
+            if role is ObjectRole.UNKNOWN and not is_obstacle(
+                role, self.cfg.world_model.treat_unknown_robots_as_obstacles
+            ):
+                continue
+
+            known_width = (
+                self.cfg.detector.fuel_diameter_m
+                if detection.class_name == CLASS_FUEL
+                else self.cfg.detector.bumper_width_m
+            )
+            estimate = self._stage(
+                "ranging",
+                lambda d=detection, c=cam, w=known_width: _range_one(
+                    d, c, self.cfg.ranging, w
+                ),
+            )
+            if estimate is None or not estimate.valid:
+                continue
+            results.append(
+                RobotObservation(
+                    camera_name=detection.camera_name,
+                    timestamp=detection.timestamp,
+                    class_name=detection.class_name,
+                    role=role,
+                    confidence=detection.confidence,
+                    x_robot_m=estimate.x_robot_m,
+                    y_robot_m=estimate.y_robot_m,
+                    range_m=estimate.range_m,
+                    bearing_rad=estimate.bearing_rad,
+                    quality=estimate.quality,
+                )
+            )
+        return results
+
+    def _update_world(self, observations, pose_estimate, now: float) -> None:
+        if not pose_estimate.valid:
+            # Field-space tracks recorded against an unknown pose are worse
+            # than no tracks: they look authoritative and are wrong.
+            self.world.clear()
+            return
+        pose = pose_estimate.pose
+        field_observations = [
+            FieldObservation(
+                camera_name=observation.camera_name,
+                timestamp=observation.timestamp,
+                class_name=observation.class_name,
+                role=observation.role,
+                confidence=observation.confidence,
+                x_field_m=field_x,
+                y_field_m=field_y,
+                range_m=observation.range_m,
+                quality=observation.quality,
+            )
+            for observation, (field_x, field_y) in (
+                (o, robot_to_field(o.x_robot_m, o.y_robot_m, pose.x, pose.y, pose.theta))
+                for o in observations
+            )
+        ]
+        self.world.update(field_observations, now)
+
+    def _navigate(self, pose_estimate, now: float) -> DesiredMotion:
+        fuel = filter_usable_tracks(
+            self.world.game_pieces(now), self.world.freshness, now
+        )
+        opponents = filter_usable_tracks(
+            self.world.obstacle_robots(now), self.world.freshness, now
+        )
+        return self.navigator.plan(pose_estimate, fuel, opponents, now)
+
+    def _publish(self, frames, pose_estimate, motion, controller_state, now: float) -> None:
+        fuel = self.world.game_pieces(now)
+        opponents = self.world.obstacle_robots(now)
+        health = self.cameras.health()
+        camera_health = [
+            (
+                health[name].healthy if name in health else False,
+                health[name].fps if name in health else 0.0,
+            )
+            for name in self._camera_order
+        ]
+
+        latency_ms = 0.0
+        if frames:
+            oldest = min(frame.timestamp for frame in frames.values())
+            latency_ms = max(0.0, (time.monotonic() - oldest) * 1000.0)
+        self.stats.perception_latency_ms = latency_ms
+
+        target = motion.target or (math.nan, math.nan)
+        payload = build_perception_payload(
+            balls_field_x=[t.x for t in fuel],
+            balls_field_y=[t.y for t in fuel],
+            balls_field_vx=[t.vx for t in fuel],
+            balls_field_vy=[t.vy for t in fuel],
+            opponents_field_x=[t.x for t in opponents],
+            opponents_field_y=[t.y for t in opponents],
+            opponents_field_vx=[t.vx for t in opponents],
+            opponents_field_vy=[t.vy for t in opponents],
+            robot_x=pose_estimate.pose.x,
+            robot_y=pose_estimate.pose.y,
+            robot_theta=pose_estimate.pose.theta,
+            pose_valid=pose_estimate.valid,
+            pose_invalid_reason=pose_estimate.invalid_reason,
+            frame_counter=self.stats.frame_counter,
+            camera_health=camera_health,
+            model_loaded=self.detector.loaded,
+            odometry_fresh=pose_estimate.odometry_fresh,
+            tag_pose_available=pose_estimate.tag_pose_available,
+            tag_count=pose_estimate.tag_count,
+            localization_source=pose_estimate.source.value,
+            localization_quality=pose_estimate.quality,
+            translation_disagreement_m=pose_estimate.translation_disagreement_m,
+            heading_disagreement_deg=math.degrees(pose_estimate.heading_disagreement_rad),
+            loop_fps=self.stats.loop_fps,
+            perception_latency_ms=latency_ms,
+            inference_ms=self.stats.inference_ms,
+            apriltag_ms=self.stats.apriltag_ms,
+            nav_reason=motion.reason,
+            nav_vx=motion.vx_mps,
+            nav_vy=motion.vy_mps,
+            nav_omega=motion.omega_radps,
+            nav_target_x=float(target[0]),
+            nav_target_y=float(target[1]),
+            nav_has_target=motion.target is not None,
+            virtual_controller_enabled=self.cfg.controller.enabled,
+        )
+        self.nt.publish_perception(payload)
+        self.nt.publish_controller(controller_state)
+        flush = getattr(self.nt, "flush", None)
+        if callable(flush):
+            flush()
+
+    # -- diagnostics -------------------------------------------------------
+
+    def _log_camera_health(self) -> None:
+        for name, health in self.cameras.health().items():
+            # "recovered" only reads correctly the second time a camera comes
+            # up; the first time it is simply starting.
+            first_time = name not in self._cameras_seen_healthy
+            if health.healthy:
+                self._cameras_seen_healthy.add(name)
+            self._states.log(
+                f"camera:{name}", health.healthy,
+                f"camera {name} {'streaming' if first_time else 'RECOVERED'} "
+                f"({health.frames_captured} frames)",
+                f"camera {name} UNHEALTHY (opened={health.opened} "
+                f"age={health.last_frame_age_s:.2f}s {health.last_error})",
+            )
+
+    def _update_loop_stats(self, now: float) -> None:
+        self._loop_times.append(now)
+        cutoff = now - 2.0
+        while self._loop_times and self._loop_times[0] < cutoff:
+            self._loop_times.pop(0)
+        if len(self._loop_times) >= 2:
+            span = self._loop_times[-1] - self._loop_times[0]
+            self.stats.loop_fps = (len(self._loop_times) - 1) / span if span > 0 else 0.0
+
+    def _periodic_status(self, now: float, pose_estimate, motion) -> None:
+        if now - self._last_status_log < self.cfg.logging.status_period_s:
+            return
+        self._last_status_log = now
+        health = self.cameras.health()
+        cameras = " ".join(
+            f"{name}={'ok' if h.healthy else 'BAD'}@{h.fps:.0f}" for name, h in health.items()
+        )
+        logger.info(
+            "status loop=%.1ffps %s alliance=%s pose=%s(%s) fuel=%d opp=%d "
+            "infer=%.0fms latency=%.0fms nav=%s",
+            self.stats.loop_fps, cameras, self.alliance.value,
+            "VALID" if pose_estimate.valid else "INVALID", pose_estimate.source.value,
+            len(self.world.game_pieces(now)), len(self.world.obstacle_robots(now)),
+            self.stats.inference_ms, self.stats.perception_latency_ms, motion.reason,
+        )
+
+
+def _range_one(detection, cam, ranging, known_width):
+    """Module-level so the lambda in ``_range_detections`` stays readable."""
+    from .geometry import estimate_ground_object
+
+    return estimate_ground_object(detection.bbox, cam, ranging, known_width)
+
+
+__all__ = ["PerceptionApp"]

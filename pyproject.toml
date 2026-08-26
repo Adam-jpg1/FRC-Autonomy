@@ -1,3 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frc-jetson-perception"
+version = "1.0.0"
+description = "FRC 2026 Jetson perception, localization, world model and navigation assistance"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.23",
+]
+
+[tool.setuptools]
+packages = ["frc_perception"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:frc_perception.*"]

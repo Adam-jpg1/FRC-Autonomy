@@ -1,29 +1,54 @@
-# Python dependencies. Read the Jetson notes below BEFORE `pip install -r`.
+# Python dependencies for the FRC 2026 Jetson perception system.
 #
-# JETSON TORCH/CUDA CAVEAT (important):
-#   `ultralytics` pulls in `torch` from PyPI, whose ARM wheels are CPU-ONLY.
-#   On the Jetson Orin Nano you must FIRST install NVIDIA's CUDA-enabled
-#   torch/torchvision wheels matching your JetPack version, from
-#   https://developer.nvidia.com/embedded/downloads (or the PyTorch for
-#   Jetson forum thread), and only then install ultralytics WITHOUT letting
-#   pip replace torch:
-#       pip3 install <nvidia-torch-wheel>.whl <nvidia-torchvision-wheel>.whl
-#       pip3 install ultralytics --no-deps
-#       pip3 install -r requirements.txt --no-deps  # then fill gaps manually
-#   Verify with:  python3 -c "import torch; print(torch.cuda.is_available())"
-#   For competition, export the model to TensorRT: `yolo export format=engine`.
+# ===========================================================================
+# READ THIS BEFORE RUNNING `pip install -r requirements.txt` ON THE JETSON
+# ===========================================================================
 #
-# OPENCV NOTE: JetPack ships a CUDA-built OpenCV as a system package. If
-#   `import cv2` already works on the Jetson, do NOT pip-install
-#   opencv-python over it (the pip wheel is CPU-only).
+# TORCH / CUDA
+#   `ultralytics` depends on `torch`. The torch wheels on PyPI for aarch64
+#   are CPU-ONLY. Installing them on a Jetson gives you a working import and
+#   roughly 10x less performance, with no error to tell you why.
 #
-# pupil-apriltags builds native code on ARM: needs `sudo apt install cmake`.
+#   On the Jetson Orin Nano:
+#     1. FIRST install NVIDIA's CUDA-enabled torch/torchvision wheels for
+#        your exact JetPack version (NVIDIA's "PyTorch for Jetson" resources).
+#     2. Verify:  python3 -c "import torch; print(torch.cuda.is_available())"
+#        This must print True before you continue.
+#     3. THEN install ultralytics without letting pip replace torch:
+#          pip3 install ultralytics --no-deps
+#          pip3 install -r requirements.txt --no-deps
+#        and fill any remaining gaps by hand.
+#
+#   If you already have a working CUDA torch, do NOT let anything upgrade it.
+#   Re-verify torch.cuda.is_available() after every pip install.
+#
+# OPENCV
+#   JetPack ships a system OpenCV. If `import cv2` already works on the
+#   Jetson, do NOT pip-install opencv-python over it -- the pip wheel is a
+#   CPU-only build and will shadow the system one. The marker below skips
+#   the pip wheel on aarch64 for exactly that reason.
+#
+# PUPIL-APRILTAGS
+#   Builds native code on ARM. Install build tools first:
+#     sudo apt install cmake build-essential
+#
+# On a laptop (PyCharm, hardware-free development) plain
+# `pip install -r requirements.txt` is fine.
+# ===========================================================================
 
-numpy
-opencv-python; platform_machine != "aarch64"
-ultralytics
-pupil-apriltags
-pyntcore          # NetworkTables 4 client (import name: ntcore)
+numpy>=1.23
 
-# Development / testing only:
-pytest
+# Skipped on aarch64: use the JetPack system OpenCV instead (see above).
+opencv-python>=4.8; platform_machine != "aarch64"
+
+# YOLO. On the Jetson install this with --no-deps AFTER NVIDIA's torch.
+ultralytics>=8.1
+
+# AprilTag detection. Needs cmake to build on ARM.
+pupil-apriltags>=1.0.4
+
+# NetworkTables 4 client. Import name is `ntcore`.
+pyntcore>=2024.1
+
+# --- development / testing only --------------------------------------------
+pytest>=7.0
