@@ -629,6 +629,22 @@ sign is wrong. **Fix the config, never the math** — the math is tested.
 
 ## 12. Hardware-free testing
 
+### Decision-logic harness (start here before any hardware)
+
+```bash
+python test_decisions.py --scenario all      # 26 scenarios, PASS/FAIL
+python test_decisions.py --interactive       # type values, see decisions
+```
+
+Drives the **real** decision pipeline — scheduler, ranging, localization,
+world model, navigation, controller, NT payload — with synthetic
+detections. Only camera capture and GPU inference are replaced. Lets you
+test autonomy behavior before the cameras or roboRIO exist, and asserts
+PASS/FAIL rather than just printing. See
+[`TESTING_DECISIONS.md`](TESTING_DECISIONS.md).
+
+### Replay and simulation
+
 Most development needs no robot.
 
 ```bash
