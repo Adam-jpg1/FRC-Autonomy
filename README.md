@@ -631,6 +631,11 @@ sign is wrong. **Fix the config, never the math** — the math is tested.
 
 ### Decision-logic harness (start here before any hardware)
 
+Deploying to a Jetson for the first time?
+**[`DEPLOY_JETSON.md`](DEPLOY_JETSON.md)** is the step-by-step guide:
+clone, a JetPack-safe environment, running the scenarios and interactive
+mode, and CUDA/PyTorch verification kept separate.
+
 ```bash
 python test_decisions.py --scenario all      # 26 scenarios, PASS/FAIL
 python test_decisions.py --interactive       # type values, see decisions

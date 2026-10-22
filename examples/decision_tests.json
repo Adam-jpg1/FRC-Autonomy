@@ -1,0 +1,167 @@
+{
+  "scenarios": [
+    {
+      "name": "a_fuel_detected_ahead",
+      "description": "One confident fuel 3 m directly ahead of the robot. Expect it ranged, tracked at field (8, 3), chosen as the target, and a forward +X command.",
+      "pose_mode": "odometry_only",
+      "robot_pose": [5.0, 3.0, 0.0],
+      "is_red_alliance": true,
+      "cameras": ["cam0"],
+      "cycles": [
+        {
+          "advance_s": 0.033,
+          "note": "fuel 3 m ahead",
+          "frames": [
+            {
+              "camera_id": "cam0",
+              "seq": 1,
+              "capture_offset_s": 0.0,
+              "detections": [
+                {"class_name": "fuel", "confidence": 0.92, "x_robot_m": 3.0, "y_robot_m": 0.0}
+              ]
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "pose_valid": true,
+        "observations": 1,
+        "fuel_tracks": 1,
+        "fuel_track_near": [8.0, 3.0, 0.1],
+        "has_target": true,
+        "translation_nonzero": true,
+        "nav_vx_sign": 1,
+        "nav_vy_sign": 0,
+        "controller_enabled": false,
+        "controller_axes_zero": true
+      }
+    },
+    {
+      "name": "b_no_detection",
+      "description": "Camera healthy and delivering frames, nothing in view. Pose is valid so the robot may search, but with no search point configured it must spin in place: zero translation, non-zero rotation.",
+      "pose_mode": "odometry_only",
+      "robot_pose": [5.0, 3.0, 0.0],
+      "is_red_alliance": true,
+      "cameras": ["cam0"],
+      "config": {"navigation.search_point_field": null},
+      "cycles": [
+        {
+          "advance_s": 0.033,
+          "note": "empty frame",
+          "frames": [{"camera_id": "cam0", "seq": 1, "capture_offset_s": 0.0, "detections": []}]
+        }
+      ],
+      "expect": {
+        "pose_valid": true,
+        "observations": 0,
+        "fuel_tracks": 0,
+        "translation_zero": true,
+        "omega_nonzero": true,
+        "has_target": false,
+        "controller_enabled": false
+      }
+    },
+    {
+      "name": "c_stale_frame",
+      "description": "A frozen camera: the frame was captured 600 ms ago, past frame_freshness_s (250 ms). The scheduler must refuse it BEFORE inference, so nothing is inferred and one stale frame is counted.",
+      "pose_mode": "odometry_only",
+      "robot_pose": [5.0, 3.0, 0.0],
+      "is_red_alliance": true,
+      "cameras": ["cam0"],
+      "config": {"navigation.search_point_field": null},
+      "cycles": [
+        {
+          "advance_s": 0.033,
+          "note": "frame is 600 ms old",
+          "frames": [
+            {
+              "camera_id": "cam0",
+              "seq": 1,
+              "capture_offset_s": -0.6,
+              "detections": [
+                {"class_name": "fuel", "confidence": 0.95, "x_robot_m": 3.0, "y_robot_m": 0.0}
+              ]
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "inferred_frames": [],
+        "stale_frames_dropped": 1,
+        "fuel_tracks": 0,
+        "translation_zero": true,
+        "controller_enabled": false
+      }
+    },
+    {
+      "name": "d_invalid_robot_pose",
+      "description": "THE safety rule. Tag initialization is required and no tag has been seen, so the pose is invalid while a confident fuel sits 3 m ahead. Field coordinates are meaningless, so translation must be exactly zero; only an in-place search rotation is permitted.",
+      "pose_mode": "invalid",
+      "robot_pose": [5.0, 3.0, 0.0],
+      "is_red_alliance": true,
+      "cameras": ["cam0"],
+      "cycles": [
+        {
+          "advance_s": 0.033,
+          "note": "fuel in view but we do not know where we are",
+          "frames": [
+            {
+              "camera_id": "cam0",
+              "seq": 1,
+              "capture_offset_s": 0.0,
+              "detections": [
+                {"class_name": "fuel", "confidence": 0.99, "x_robot_m": 3.0, "y_robot_m": 0.0}
+              ]
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "pose_valid": false,
+        "translation_zero": true,
+        "omega_nonzero": true,
+        "has_target": false,
+        "all_tracks": 0,
+        "nav_reason_contains": "pose invalid",
+        "controller_enabled": false,
+        "controller_axes_zero": true
+      }
+    },
+    {
+      "name": "e_unhealthy_detector",
+      "description": "The detector is down. It must produce NO detections -- never fabricated, never a frozen last result -- so no tracks are created and navigation falls back to searching with zero translation.",
+      "pose_mode": "odometry_only",
+      "robot_pose": [5.0, 3.0, 0.0],
+      "is_red_alliance": true,
+      "cameras": ["cam0"],
+      "config": {"navigation.search_point_field": null},
+      "cycles": [
+        {
+          "advance_s": 0.033,
+          "note": "detector unhealthy, but a fuel is in front of the robot",
+          "detector_healthy": false,
+          "frames": [
+            {
+              "camera_id": "cam0",
+              "seq": 1,
+              "capture_offset_s": 0.0,
+              "detections": [
+                {"class_name": "fuel", "confidence": 0.95, "x_robot_m": 3.0, "y_robot_m": 0.0}
+              ]
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "detector_healthy": false,
+        "observations": 0,
+        "fuel_tracks": 0,
+        "all_tracks": 0,
+        "translation_zero": true,
+        "pose_valid": true,
+        "controller_enabled": false,
+        "controller_axes_zero": true
+      }
+    }
+  ]
+}

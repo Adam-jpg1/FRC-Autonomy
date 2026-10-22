@@ -297,6 +297,17 @@ bring-up fills in `frc_perception/config.py` from
 
 ### Production finding: same-camera detections are merged
 
+> **STATUS: OPEN — production behavior deliberately unchanged.**
+> Last reviewed 2026-10-22. No code change has been made, and none should
+> be made without the team deciding the trade-off below. The behavior is
+> pinned by the `adjacent_objects_merge_within_radius` scenario so a
+> future change shows up as a deliberate test edit, not a silent drift.
+>
+> Reproduce it in one command, no hardware:
+> ```bash
+> python3 test_decisions.py --scenario adjacent_objects_merge_within_radius --verbose
+> ```
+
 `world_model.merge_observations()` is documented as *cross-camera*
 de-duplication, but it merges any two same-class observations within the
 merge radius **regardless of which camera produced them**.
@@ -320,12 +331,34 @@ system while building a harness to measure it would be the wrong order of
 operations. `adjacent_objects_merge_within_radius` pins the current
 behavior so a future change is a visible, deliberate decision.
 
-The fix, if you want it: require `candidate.camera_id` not already present
-in the group before merging, in `merge_observations()`. That keeps the
-stated cross-camera intent and stops conflating distinct adjacent objects.
-It would require updating `test_merging_is_transitive_across_a_chain` in
-`tests/test_world_model.py`, which currently asserts the same-camera
-behavior.
+#### The decision the team has to make
+
+Both options are defensible; this is a trade-off, not an oversight.
+
+| | keep current behavior | restrict merging to cross-camera |
+|---|---|---|
+| a ball split into two boxes by an occluder | cleaned up into one object | reported as two balls |
+| two real balls 0.32 m apart | **collapsed into one** | correctly two |
+| two opponents 0.8 m apart | **collapsed into one obstacle** | correctly two |
+| effect on `weight_density` scoring | under-counts dense pockets | scores them as intended |
+
+#### The fix, when you want it
+
+In `frc_perception/world_model.py`, `merge_observations()`: track the set
+of `camera_id` values already in a group and refuse a candidate whose
+camera is already represented. That keeps the stated cross-camera intent
+and stops conflating distinct adjacent objects.
+
+Two tests would then need updating — neither is a weakening, both would
+be re-expressing the new intent:
+
+- `tests/test_world_model.py::test_merging_is_transitive_across_a_chain`
+  currently asserts three same-camera sightings merge into one.
+- `test_decisions.py` scenario `adjacent_objects_merge_within_radius`
+  currently pins `fuel_tracks: 2`; it would become `3`.
+
+Decide first, then change both the code and those two expectations in one
+commit, so the diff states the decision.
 
 ### Confirmed-correct behavior that looked wrong at first
 
