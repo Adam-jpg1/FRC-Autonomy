@@ -29,8 +29,17 @@ def payload(**overrides):
         pose_valid=True,
         pose_invalid_reason="",
         frame_counter=42,
-        camera_health=[(True, 29.5), (False, 0.0)],
+        camera_health=[(True, 29.5, 14.8, 3), (False, 0.0, 0.0, 0)],
         model_loaded=True,
+        detector_healthy=True,
+        detector_classes_ok=True,
+        detector_error="",
+        detector_latency_ms=12.5,
+        preprocess_ms=2.0,
+        postprocess_ms=1.5,
+        frames_skipped=7,
+        stale_frames_dropped=1,
+        stale_results_dropped=2,
         odometry_fresh=True,
         tag_pose_available=True,
         tag_count=2,
@@ -78,6 +87,7 @@ def test_diagnostic_keys_required_by_the_contract_are_present():
     for key in (
         "model_loaded", "odometry_fresh", "tag_pose_available",
         "localization_source", "loop_fps", "perception_latency_ms",
+        "camera_0_healthy", "camera_1_healthy", "camera_0_fps", "camera_1_fps",
     ):
         assert key in result
 
@@ -156,3 +166,36 @@ def test_required_keys_tuple_matches_the_documented_contract():
         "robot_x", "robot_y", "robot_theta",
         "pose_valid", "frame_counter", "ball_count", "opponent_count",
     }
+
+
+def test_capture_and_inference_rates_are_published_separately():
+    """With one GPU serving two cameras these genuinely differ, and
+    conflating them hides whether capture or inference is the bottleneck."""
+    result = payload()
+    assert result["camera_0_fps"] == pytest.approx(29.5)
+    assert result["camera_0_inference_fps"] == pytest.approx(14.8)
+    assert result["camera_0_frames_skipped"] == 3
+
+
+def test_detector_diagnostics_are_published():
+    result = payload()
+    assert result["detector_healthy"] is True
+    assert result["detector_classes_ok"] is True
+    assert result["detector_latency_ms"] == pytest.approx(12.5)
+    assert result["stale_results_dropped"] == 2
+    assert result["frames_skipped"] == 7
+
+
+def test_an_unhealthy_detector_is_visible_on_the_dashboard():
+    """A dead detector must be diagnosable from the driver station."""
+    result = payload(
+        detector_healthy=False,
+        model_loaded=False,
+        detector_error="failed to load models/best.pt",
+        balls_field_x=[], balls_field_y=[],
+        balls_field_vx=[], balls_field_vy=[],
+    )
+    assert result["detector_healthy"] is False
+    assert result["model_loaded"] is False
+    assert "best.pt" in result["detector_error"]
+    assert result["ball_count"] == 0

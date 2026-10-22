@@ -340,7 +340,7 @@ class AprilTagLocalizer:
 
             observations.append(
                 TagObservation(
-                    camera_name=cam.name,
+                    camera_id=cam.name,
                     timestamp=timestamp,
                     tag_id=tag_id,
                     robot_pose=pose,

@@ -194,7 +194,7 @@ def main() -> int:
                 for name, frame in frames.items():
                     display = frame.image.copy()
                     for observation in observations:
-                        if observation.camera_name != name:
+                        if observation.camera_id != name:
                             continue
                         cv2.putText(
                             display,

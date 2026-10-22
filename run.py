@@ -17,12 +17,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import platform
 import sys
 from typing import Dict, List, Optional, Tuple
 
 # Make the package importable when run from a checkout without installing.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from frc_perception.camera import list_video_devices  # noqa: E402
 from frc_perception.config import (  # noqa: E402
     AppConfig,
     config_summary,
@@ -100,22 +102,103 @@ def check_imports(report: CheckReport) -> Dict[str, bool]:
                 f"import.{module}",
                 f"unavailable: {exc} -- needed for {why}",
             )
-    if available.get("torch"):
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                report.add(PASS, "torch.cuda", torch.cuda.get_device_name(0))
-            else:
-                report.add(
-                    WARN,
-                    "torch.cuda",
-                    "no CUDA device; YOLO will run on CPU. On the Jetson, install "
-                    "NVIDIA's torch wheel (see requirements.txt).",
-                )
-        except Exception as exc:  # noqa: BLE001
-            report.add(WARN, "torch.cuda", f"probe failed: {exc}")
     return available
+
+
+def read_model_name() -> str:
+    """Jetson boards publish their name in the device tree."""
+    for path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+        try:
+            with open(path, "rb") as handle:
+                return handle.read().decode("utf-8", "replace").strip("\x00\n ")
+        except OSError:
+            continue
+    return ""
+
+
+def check_platform(cfg: AppConfig, report: CheckReport) -> bool:
+    """Identify the machine.  Returns True if it looks like the target Jetson."""
+    machine = platform.machine()
+    bits = platform.architecture()[0]
+    model = read_model_name()
+
+    report.add(PASS, "platform.configured", cfg.platform)
+    report.add(PASS, "platform.arch", f"{machine} {bits} ({platform.system()})")
+    if model:
+        report.add(PASS, "platform.model", model)
+
+    is_jetson = "jetson" in model.lower() or "orin" in model.lower()
+    if cfg.platform == "jetson_orin_nano_super" and not is_jetson:
+        report.add(
+            WARN, "platform.model",
+            f"config targets the Jetson Orin Nano Super but this machine reports "
+            f"{model or 'no device-tree model'}. Fine on a development computer; "
+            "the CUDA checks below will warn instead of failing.",
+        )
+    if is_jetson and machine not in ("aarch64", "arm64"):
+        report.add(FAIL, "platform.arch", f"Jetson running a {machine} userland")
+    if bits != "64bit":
+        report.add(FAIL, "platform.arch", f"{bits} Python; 64-bit is required")
+    return is_jetson
+
+
+def check_cuda(cfg: AppConfig, report: CheckReport, have_torch: bool, on_jetson: bool) -> None:
+    """CUDA availability, and whether this configuration tolerates its absence."""
+    if not have_torch:
+        report.add(
+            FAIL if on_jetson else WARN, "cuda.torch",
+            "torch not importable. On the Jetson, install NVIDIA's CUDA torch "
+            "wheel for your JetPack version BEFORE ultralytics (see "
+            "requirements.txt).",
+        )
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            report.add(
+                PASS, "cuda.device",
+                f"{torch.cuda.get_device_name(0)} (torch {torch.__version__})",
+            )
+            return
+    except Exception as exc:  # noqa: BLE001
+        report.add(WARN, "cuda.device", f"probe failed: {exc}")
+        return
+
+    # torch imported but reports no CUDA.
+    if cfg.detector.require_cuda:
+        report.add(
+            FAIL if on_jetson else WARN, "cuda.device",
+            "torch reports no CUDA device and detector.require_cuda is set, so "
+            "the detector will REFUSE to start. On the Jetson this means the "
+            "PyPI CPU wheel replaced NVIDIA's CUDA build -- reinstall it. For "
+            "laptop development set detector.require_cuda = False.",
+        )
+    else:
+        report.add(
+            WARN, "cuda.device",
+            "no CUDA device; the detector will run on the CPU because "
+            "require_cuda is False. Development only -- CPU YOLO starves "
+            "capture, AprilTags and the main loop.",
+        )
+
+
+def check_tensorrt(cfg: AppConfig, report: CheckReport) -> None:
+    """A TensorRT engine is tied to the machine that built it."""
+    path = cfg.detector.model_path
+    if not path.endswith(".engine"):
+        report.add(
+            PASS, "tensorrt.engine",
+            f"not in use (model is {os.path.basename(path)}); .pt is the right "
+            "place to start",
+        )
+        return
+    report.add(
+        WARN, "tensorrt.engine",
+        f"{path} is a TensorRT engine. It is valid ONLY on the GPU, JetPack and "
+        "TensorRT version that built it -- rebuild it on this Jetson after any "
+        "JetPack upgrade, and re-measure with scripts/benchmark_detector.py.",
+    )
 
 
 def check_config(cfg: AppConfig, report: CheckReport) -> None:
@@ -195,6 +278,41 @@ def check_calibration(cfg: AppConfig, report: CheckReport) -> None:
                 f"calibration.{cam.name}",
                 "not calibrated -- run scripts/calibrate_intrinsics.py "
                 f"--camera {cam.name}",
+            )
+
+
+def check_camera_paths(cfg: AppConfig, report: CheckReport) -> None:
+    """Report the persistent device paths available on this machine."""
+    devices = list_video_devices()
+    by_id = [d for d in devices if d["kind"] == "by-id"]
+    if devices:
+        report.add(
+            PASS, "camera.devices",
+            f"{len(by_id)} by-id path(s): "
+            + ", ".join(f"{os.path.basename(d['path'])} -> {d['node']}" for d in by_id[:4]),
+        )
+    else:
+        report.add(
+            WARN, "camera.devices",
+            "no /dev/v4l/by-id entries (normal on a development computer; on the "
+            "Jetson it means no USB camera is attached)",
+        )
+
+    for cam in cfg.cameras:
+        if not cam.enabled:
+            continue
+        if cam.uses_persistent_path:
+            exists = os.path.exists(cam.device_path)
+            report.add(
+                PASS if exists else FAIL,
+                f"camera.{cam.name}.path",
+                f"{cam.device_path}" + ("" if exists else " does not exist"),
+            )
+        else:
+            report.add(
+                MUST, f"camera.{cam.name}.path",
+                f"using /dev/video{cam.device_index} with no persistent path; "
+                "set device_path from `ls -l /dev/v4l/by-id/`",
             )
 
 
@@ -288,17 +406,21 @@ def scan_must_input(root: str) -> List[Tuple[str, int, str]]:
 
 def run_check(cfg: AppConfig, root: str, probe_cameras: bool = True) -> int:
     print("=" * 78)
-    print("FRC 2026 Jetson perception -- preflight check")
+    print("FRC 2026 perception -- preflight check (Jetson Orin Nano Super)")
     print("=" * 78)
     print(config_summary(cfg))
 
     report = CheckReport()
     check_python(report)
+    on_jetson = check_platform(cfg, report)
     available = check_imports(report)
     check_config(cfg, report)
+    check_cuda(cfg, report, available.get("torch", False), on_jetson)
+    check_tensorrt(cfg, report)
     check_model(cfg, report, available.get("ultralytics", False))
     check_field_layout(cfg, report)
     check_calibration(cfg, report)
+    check_camera_paths(cfg, report)
     if probe_cameras:
         check_cameras(cfg, report, available.get("cv2", False))
     else:

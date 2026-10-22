@@ -47,8 +47,9 @@ one.
 
 | module | responsibility |
 |---|---|
-| `frc_perception/camera.py` | threaded capture, health, reconnect, **frame freshness** |
-| `frc_perception/detector.py` | YOLO inference (`predict` only — never `track`) |
+| `frc_perception/camera.py` | threaded USB/V4L2 capture, health, reconnect, **frame freshness** |
+| `frc_perception/detector.py` | **the hardware boundary**: YOLO inference (`predict` only — never `track`) |
+| `frc_perception/inference_scheduler.py` | two cameras → one GPU, newest frame only, no queue |
 | `frc_perception/geometry.py` | pixels → robot-relative range and bearing; frame transforms |
 | `frc_perception/apriltag_locator.py` | AprilTag detection and per-tag pose solving |
 | `frc_perception/field_map.py` | the official WPILib tag layout |
@@ -80,8 +81,20 @@ Three, each for a specific reason:
   works from the project root as the docs assume. **Edit
   `frc_perception/config.py`.**
 
-Tests for `camera.py`, `nt_io.py`, `config.py` and the app loop were added
-beyond the requested set.
+- **`frc_perception/inference_scheduler.py`** exists because there are two
+  cameras and one GPU. It is scheduling policy, not detection, and keeping
+  it out of `detector.py` lets both be tested independently.
+
+Tests for `camera.py`, `nt_io.py`, `config.py`, the scheduler and the app
+loop were added beyond the requested set.
+
+### The hardware boundary
+
+`detector.py` is the only module that knows what runs inference.
+`geometry.py` contains no CUDA code, `world_model.py` imports no
+Ultralytics, `navigation.py` has never heard of a `.engine` file.
+Everything below `Detection[]` is unchanged if the inference hardware
+changes.
 
 ### Design principles, in priority order
 
@@ -106,13 +119,28 @@ beyond the requested set.
         │  camera 0    │   │  camera 1    │      independent threads,
         │  OV9782 USB  │   │  OV9782 USB  │      latest-frame only
         └──────┬───────┘   └──────┬───────┘
-               │ Frame(seq, timestamp, image)
+               │ Frame(camera_id, seq, capture_timestamp, image)
                │  ── frames older than frame_freshness_s are DISCARDED ──
                ▼                  ▼
      ┌───────────────────────────────────────┐
-     │  detector.py    YOLO predict()        │  fuel / bumper_blue / bumper_red
+     │  inference_scheduler.py               │  freshness-aware round robin,
+     │  NO QUEUE: newest frame per camera    │  skipped frames counted
      └──────────────┬────────────────────────┘
-                    │ Detection (pixels)
+                    │ one frame at a time
+                    ▼
+     ┌───────────────────────────────────────┐
+     │  detector.py    YOLO predict()        │  fuel / bumper_blue / bumper_red
+     │  CUDA (or a TensorRT .engine)         │  routing by class NAME
+     └──────────────┬────────────────────────┘
+                    │ InferenceResult
+                    │  ── results older than max_detection_result_age_s
+                    │     are DISCARDED, not injected into the world model ──
+                    ▼
+     ┌───────────────────────────────────────┐
+     │  Detection[]  ==  THE HARDWARE        │
+     │  BOUNDARY. Nothing below knows what   │
+     │  produced these.                      │
+     └──────────────┬────────────────────────┘
                     ▼
      ┌───────────────────────────────────────┐   alliance.py
      │  class name ─► role                   │◄── FMSInfo/IsRedAlliance
@@ -332,12 +360,31 @@ it works there is nothing to optimize. The system publishes `loop_fps`,
 NetworkTables — **measure those on your Jetson**. No frame rate is claimed
 here because none has been measured.
 
+Measure before changing anything:
+
+```bash
+python scripts/benchmark_detector.py --images data/samples/
+python scripts/benchmark_detector.py --video data/clips/practice.mp4 --frames 300
+```
+
+Then watch `loop_fps`, `camera_N_fps`, `camera_N_inference_fps`,
+`detector_latency_ms`, `frames_skipped` and `stale_results_dropped` on the
+`Perception` table while the robot runs. Re-measure warm, in the closed
+electronics bay — the Orin throttles, and a number from the first thirty
+seconds is not the number you get in the third match.
+
+A high `frames_skipped` count is **not a bug**. It means capture is
+outrunning inference and the scheduler is correctly discarding old frames.
+It tells you how fast you can drive before the world model lags.
+
 If you need more, in this order:
 
 1. `sudo nvpmodel -m 0 && sudo jetson_clocks` (max power mode).
 2. Lower `detector.imgsz` (640 → 480) and re-measure mAP as well as FPS.
-3. Raise `apriltag.detect_every_n_frames` to 2 or 3.
-4. Raise `apriltag.quad_decimate`.
+3. Drop `max_inferences_per_cycle` to 1 — the round robin still alternates
+   fairly, each camera just runs at half rate.
+4. Raise `apriltag.detect_every_n_frames` to 2 or 3.
+5. Raise `apriltag.quad_decimate`.
 5. **Then** consider TensorRT:
    ```bash
    yolo export model=models/best.pt format=engine half=True device=0
@@ -397,7 +444,13 @@ Required contract keys:
 Diagnostics (also always published):
 
 `camera_0_healthy`, `camera_1_healthy`, `camera_0_fps`, `camera_1_fps`,
-`model_loaded`, `odometry_fresh`, `tag_pose_available`, `tag_count`,
+`camera_0_inference_fps`, `camera_1_inference_fps`,
+`camera_0_frames_skipped`, `camera_1_frames_skipped`,
+`model_loaded`, `detector_healthy`, `detector_classes_ok`,
+`detector_error`, `detector_latency_ms`, `preprocess_ms`,
+`postprocess_ms`, `frames_skipped`, `stale_frames_dropped`,
+`stale_results_dropped`,
+`odometry_fresh`, `tag_pose_available`, `tag_count`,
 `localization_source`, `localization_quality`, `pose_invalid_reason`,
 `translation_disagreement_m`, `heading_disagreement_deg`, `loop_fps`,
 `perception_latency_ms`, `inference_ms`, `apriltag_ms`,
@@ -406,7 +459,10 @@ Diagnostics (also always published):
 `nav_omega_radps`, `nav_target_x`, `nav_target_y`, `nav_has_target`,
 `virtual_controller_enabled`.
 
-`camera_N_*` is indexed by position in `config.cameras`.
+`camera_N_*` is indexed by position in `config.cameras`. Capture rate
+(`camera_N_fps`) and inference rate (`camera_N_inference_fps`) are separate
+numbers: with one GPU serving two cameras they are expected to differ, and
+conflating them hides whether capture or inference is the bottleneck.
 
 `opponents_field_*` contains every robot that must be **avoided**. With a
 known alliance that is the opposing robots. With the alliance unknown or
@@ -632,12 +688,13 @@ Do these in order. Do not skip ahead to autonomous driving.
 |---|---|---|
 | **1** | `pytest` | the math and the logic are intact |
 | **2** | `python run.py --check` | config, imports, model, layout, calibration, MUST INPUTs |
-| **3** | `python scripts/camera_preview.py --camera 0` | camera 0 streams at the expected resolution and rate |
-| **4** | `python scripts/camera_preview.py --camera 1` | camera 1 does too, independently |
+| **3** | `python scripts/camera_preview.py --list` | the persistent device paths, for `device_path` |
+| **4** | `python scripts/camera_preview.py --camera cam0` then `cam1` | each camera streams at the expected resolution and rate, independently |
 | **5** | `python scripts/test_yolo_image.py --model models/best.pt --image shot.jpg` | the model loads and has the right classes |
 | **6** | `python run.py --sim-nt --replay cam0=clip.mp4` | the whole pipeline runs on recorded video |
 | **7** | `python run.py --sim-nt --replay cam0=/dev/…` or live with one camera enabled | live YOLO on one camera |
-| **8** | `python run.py --sim-nt` with both cameras enabled | live YOLO on both, watch `camera_N_fps` and `loop_fps` |
+| **8** | `python scripts/benchmark_detector.py --images data/samples/` | **measured** latency and FPS on this Jetson |
+| **8b** | `python run.py --sim-nt` with both cameras enabled | live YOLO on both; watch `camera_N_inference_fps`, `frames_skipped`, `stale_results_dropped` |
 | **9** | `python run.py` (controller still disabled) | NetworkTables connects; watch the `Perception` table |
 | **10** | watch `odometry_fresh` | roboRIO odometry arrives and its timestamp advances |
 | **11** | `python scripts/verify_localization.py` | tags are detected and produce poses |
@@ -690,11 +747,33 @@ in-place search rotation, which needs no field coordinates — and that is
 configurable off. This is the first branch in `Navigator.plan()` and it has
 its own tests.
 
+### A dead detector fails safe, and loudly
+
+If the model will not load or inference starts failing:
+
+- the detector reports **unhealthy** and produces **no detections** — never
+  fabricated ones and never a frozen last result;
+- `detector.require_cuda` (default **True**) means it refuses to start at
+  all on a CPU device rather than quietly delivering a few frames per
+  second while starving capture, AprilTags and the main loop;
+- existing world-model tracks **age out** on their own — the last known
+  ball position is never frozen in place;
+- `detector_healthy`, `model_loaded` and `detector_error` on the
+  `Perception` table say exactly what happened;
+- localization, AprilTags and navigation keep running, so the robot still
+  knows where it is and still refuses to translate when it does not.
+
 ### Stale data never masquerades as fresh
 
 - Frames older than `frame_freshness_s` are discarded before YOLO sees them.
 - Odometry is fresh only while the RIO's timestamp advances.
-- Inference results older than `max_result_age_s` are dropped, not published.
+- Inference results older than `max_detection_result_age_s` are dropped
+  rather than injected into the world model — a correct answer about where
+  objects *were* is a wrong answer about where they are. The timestamp used
+  for field projection is the **original camera capture time**, never when
+  inference finished.
+- The scheduler holds no queue, so a slow cycle can never accumulate a
+  backlog of old frames.
 - Tracks age out; navigation is told whether a track is recent, aging, or
   expired.
 
@@ -708,7 +787,11 @@ its own tests.
 | `camera_N_fps` far below configured | driver ignored the FOURCC/resolution request | check the "driver gave" warning in the log; OV9782 needs `MJPG` for full rate |
 | Detections but no ranges | mount pose unmeasured (`mount_z_m = 0`) or box bottoms clipped | `run.py --check`; use `test_yolo_image.py --range cam0` to see the rejection reason |
 | Ranges consistently long or short | mount height or pitch off | re-measure, then `calibrate_distance.py` |
-| `model_loaded = false` | weights missing, or ultralytics/torch not installed | `run.py --check` names the reason |
+| `model_loaded = false` / `detector_healthy = false` | weights missing, class mismatch, or CUDA refused | `run.py --check` names the reason |
+| Detector refuses to start on CPU | `detector.require_cuda` is True (correct for competition) | fix the CUDA torch install; set it False only for laptop work |
+| High `frames_skipped` | capture outrunning inference | not a bug — the latest-frame policy working. Benchmark, then lower `imgsz` or `max_inferences_per_cycle` |
+| High `stale_results_dropped` | inference slower than `max_detection_result_age_s` | benchmark; check `nvpmodel`/throttling |
+| Cameras swapped after a reboot | using `/dev/videoN` instead of a persistent path | set `device_path` from `camera_preview.py --list` |
 | Model detects nothing | class-name mismatch — routing is by name | `scripts/test_yolo_image.py` prints the contract check |
 | YOLO very slow | CPU-only torch on the Jetson | `python3 -c "import torch; print(torch.cuda.is_available())"` must be True |
 | `pose_valid` never becomes true | no accepted tag fix yet | check `tag_count`, `apriltag.layout` in `--check`, and camera calibration — the tag detector refuses uncalibrated cameras |
@@ -736,7 +819,7 @@ lists every one still unfilled, and scans the source for the markers.
 | # | value | where | how to get it |
 |---|---|---|---|
 | 1 | Team number | `networktables.team_number` | you know this one |
-| 2 | Camera device indexes / paths | `cameras[].device_index` / `device_path` | `ls /dev/video*`, `v4l2-ctl --list-devices`; pin with udev |
+| 2 | Camera persistent device paths | `cameras[].device_path` | `python scripts/camera_preview.py --list` |
 | 3 | Camera intrinsics (fx, fy, cx, cy, distortion) | `cameras[]` | `scripts/calibrate_intrinsics.py` |
 | 4 | Lens horizontal FOV | `cameras[].horizontal_fov_deg` | your Arducam variant's spec (fallback only) |
 | 5 | Camera mount positions | `cameras[].mount_x_m/_y_m/_z_m` | tape measure, on the robot |
@@ -777,7 +860,16 @@ lists every one still unfilled, and scans the source for the markers.
   deadband/slew/heartbeat behavior.
 - Contracts: config validation, the `Perception` key set, the model
   class-name check.
-- `python run.py --check` runs and reports correctly.
+- `python run.py --check` runs and reports correctly on a machine with no
+  GPU (warnings, not import crashes).
+- The inference scheduler against a fake clock and fake cameras:
+  latest-frame selection, skip counting, no queue, stale-frame refusal,
+  stale-result rejection, round-robin fairness, per-camera failure
+  isolation, model-loaded-once, and the full timing chain.
+- The original camera capture timestamp survives inference and is what
+  field projection uses.
+- A dead detector produces no detections, lets tracks age out, and leaves
+  navigation safe.
 
 ### Written but NOT verified — requires hardware
 

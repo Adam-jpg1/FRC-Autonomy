@@ -20,7 +20,9 @@ from frc_perception.detector import compare_class_names, resolve_device
 
 def calibrated_camera(name="cam0", index=0) -> CameraConfig:
     return CameraConfig(
-        name=name, device_index=index,
+        name=name,
+        device_index=index,
+        device_path=f"/dev/v4l/by-id/usb-Arducam-{name}-video-index0",
         fx=800.0, fy=805.0, cx=640.0, cy=400.0,
         mount_x_m=0.3, mount_y_m=0.0, mount_z_m=0.6,
         pitch_deg=18.0, yaw_deg=0.0, roll_deg=0.0,
@@ -79,7 +81,7 @@ def test_duplicate_camera_names_fail():
 
 def test_two_cameras_on_one_device_fail():
     cfg = complete_config()
-    cfg.cameras[1].device_index = cfg.cameras[0].device_index
+    cfg.cameras[1].device_path = cfg.cameras[0].device_path
     assert "FAIL" in severities(cfg)
 
 
@@ -217,3 +219,48 @@ def test_an_extra_class_is_reported():
 def test_explicit_device_requests_are_passed_through():
     assert resolve_device("cpu") == "cpu"
     assert resolve_device("cuda:1") == "cuda:1"
+
+
+def test_a_camera_without_a_persistent_path_is_must_input():
+    """/dev/videoN numbers change across reboots; two identical OV9782
+    modules will eventually swap places."""
+    cfg = complete_config()
+    cfg.cameras[0].device_path = ""
+    assert any(
+        issue.severity == "MUST INPUT" and "device_path" in issue.where
+        for issue in validate_config(cfg)
+    )
+
+
+def test_persistent_path_overrides_the_index():
+    cam = calibrated_camera("cam0", 3)
+    assert cam.uses_persistent_path
+    assert cam.source == cam.device_path
+    cam.device_path = ""
+    assert not cam.uses_persistent_path
+    assert cam.source == 3
+
+
+def test_disabling_require_cuda_warns():
+    """Correct for laptop development, wrong for competition."""
+    cfg = complete_config()
+    cfg.detector.require_cuda = False
+    assert any(
+        issue.severity == "WARNING" and issue.where == "detector.require_cuda"
+        for issue in validate_config(cfg)
+    )
+
+
+def test_a_result_age_below_the_frame_freshness_limit_warns():
+    cfg = complete_config()
+    cfg.max_detection_result_age_s = cfg.frame_freshness_s / 2
+    assert any(
+        issue.severity == "WARNING" and "max_detection_result_age_s" in issue.where
+        for issue in validate_config(cfg)
+    )
+
+
+def test_a_zero_inference_budget_fails():
+    cfg = complete_config()
+    cfg.max_inferences_per_cycle = 0
+    assert "FAIL" in severities(cfg)

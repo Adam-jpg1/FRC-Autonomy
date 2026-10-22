@@ -19,6 +19,15 @@ Two failure modes are handled explicitly because both are silent:
 
 Nothing here imports OpenCV at module import time, so the rest of the
 package (and the unit tests) work on a machine without ``cv2``.
+
+PLATFORM NOTE
+-------------
+The cameras are USB/UVC devices (Arducam OV9782) captured through OpenCV's
+V4L2 backend on the Jetson Orin Nano Super.  Prefer a persistent
+``/dev/v4l/by-id/...`` path over a ``/dev/videoN`` index: the numbers are
+assigned in enumeration order, and two identical OV9782 modules will
+eventually swap between boots.  :func:`list_video_devices` prints what is
+available on this machine.
 """
 
 from __future__ import annotations
@@ -282,7 +291,7 @@ class ThreadedCamera(FrameSource):
 
             self._seq += 1
             frame = Frame(
-                camera_name=self.name, seq=self._seq, timestamp=now, image=image
+                camera_id=self.name, seq=self._seq, timestamp=now, image=image
             )
             with self._lock:
                 self._frame = frame
@@ -529,3 +538,28 @@ __all__ = [
     "ThreadedCamera",
     "build_camera_manager",
 ]
+
+
+def list_video_devices() -> List[Dict[str, str]]:
+    """Enumerate USB video devices and their persistent paths.
+
+    Returns one entry per ``/dev/v4l/by-id`` (or ``by-path``) symlink, with
+    the ``/dev/videoN`` node it currently resolves to.  Used by
+    ``run.py --check`` and ``scripts/camera_preview.py --list`` so a
+    student can fill in ``device_path`` without guessing.
+
+    Returns an empty list on a machine with no V4L2 devices (a laptop, or
+    this project's own CI) rather than raising.
+    """
+    devices: List[Dict[str, str]] = []
+    for directory, kind in (("/dev/v4l/by-id", "by-id"), ("/dev/v4l/by-path", "by-path")):
+        if not os.path.isdir(directory):
+            continue
+        for entry in sorted(os.listdir(directory)):
+            link = os.path.join(directory, entry)
+            try:
+                target = os.path.realpath(link)
+            except OSError:
+                continue
+            devices.append({"kind": kind, "path": link, "node": target})
+    return devices

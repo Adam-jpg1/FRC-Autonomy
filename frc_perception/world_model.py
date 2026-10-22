@@ -104,7 +104,7 @@ def _combine(group: List[FieldObservation]) -> FieldObservation:
     y = sum(o.y_field_m * w for o, w in zip(group, weights)) / total
     best = max(group, key=lambda o: o.confidence * o.quality)
     return FieldObservation(
-        camera_name="+".join(sorted({o.camera_name for o in group})),
+        camera_id="+".join(sorted({o.camera_id for o in group})),
         timestamp=max(o.timestamp for o in group),
         class_name=best.class_name,
         role=best.role,
