@@ -74,7 +74,9 @@ _REQUIRED_IMPORTS = (
     ("ultralytics", "YOLO object detection", False),
     ("torch", "YOLO backend; on the Jetson this must be NVIDIA's CUDA build", False),
     ("pupil_apriltags", "AprilTag detection for absolute localization", False),
-    ("ntcore", "NetworkTables 4 client (pip package: pyntcore)", False),
+    # OPTIONAL. Missing ntcore disables NetworkTables only; the rest of the
+    # pipeline runs. See frc_perception/nt_io.py for the degraded-mode notes.
+    ("ntcore", "NetworkTables 4 client (pip package: pyntcore) -- OPTIONAL", False),
 )
 
 
@@ -360,6 +362,22 @@ def check_cameras(cfg: AppConfig, report: CheckReport, have_cv2: bool) -> None:
 
 
 def check_networktables(cfg: AppConfig, report: CheckReport) -> None:
+    from frc_perception.nt_io import NT_AVAILABLE, nt_status
+
+    if NT_AVAILABLE:
+        report.add(PASS, "networktables.available", nt_status())
+    else:
+        report.add(
+            WARN,
+            "networktables.available",
+            nt_status()
+            + ". The perception pipeline still runs; nothing is published or "
+            "read. No odometry means the pose stays INVALID and translation "
+            "is suppressed (safe). Use `run.py --sim-nt` for a full-chain "
+            "test, or `pip install pyntcore` once robotpy has a wheel for "
+            "this Python version.",
+        )
+
     nt = cfg.networktables
     if nt.server_override:
         report.add(PASS, "networktables.server", f"explicit server {nt.server_override}")

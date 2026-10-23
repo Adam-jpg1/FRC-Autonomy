@@ -199,3 +199,114 @@ def test_an_unhealthy_detector_is_visible_on_the_dashboard():
     assert result["model_loaded"] is False
     assert "best.pt" in result["detector_error"]
     assert result["ball_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# NetworkTables is OPTIONAL
+# ---------------------------------------------------------------------------
+#
+# ntcore (pyntcore) has no cp310 wheel on JetPack 6.2, so the pipeline has
+# to run without it. These tests pin the degraded mode so it cannot
+# regress into a crash, and so the no-ops stay no-ops by intent rather
+# than by accident.
+
+
+def test_nt_availability_flag_matches_the_real_import_state():
+    import importlib.util
+
+    from frc_perception.nt_io import NT_AVAILABLE
+
+    assert NT_AVAILABLE is (importlib.util.find_spec("ntcore") is not None)
+
+
+def test_nt_status_describes_the_situation_either_way():
+    from frc_perception.nt_io import NT_AVAILABLE, nt_status
+
+    status = nt_status()
+    assert status
+    if NT_AVAILABLE:
+        assert "available" in status
+    else:
+        assert "UNAVAILABLE" in status and "disabled" in status
+
+
+def test_the_module_imports_even_without_ntcore():
+    """The whole point: a missing optional dependency must not stop import."""
+    import frc_perception.nt_io as module
+
+    assert hasattr(module, "NetworkTablesIO")
+    assert hasattr(module, "NT_AVAILABLE")
+
+
+def unavailable_backend(monkeypatch):
+    """A real NetworkTablesIO with ntcore forced unavailable."""
+    from frc_perception.config import NetworkTablesConfig
+    from frc_perception.nt_io import NetworkTablesIO
+
+    import frc_perception.nt_io as module
+
+    monkeypatch.setattr(module, "NT_AVAILABLE", False)
+    monkeypatch.setattr(module, "NT_IMPORT_ERROR", "ModuleNotFoundError: no ntcore")
+    return NetworkTablesIO(NetworkTablesConfig(team_number=1234))
+
+
+def test_connect_does_not_raise_when_nt_is_unavailable(monkeypatch):
+    backend = unavailable_backend(monkeypatch)
+    backend.connect()  # must not raise
+    assert backend.connected is False
+    assert backend.available is False
+    assert "UNAVAILABLE" in backend.load_error
+
+
+def test_publishing_is_a_no_op_when_nt_is_unavailable(monkeypatch):
+    """Nothing may be transmitted, and nothing may blow up."""
+    from frc_perception.types import ControllerState
+
+    backend = unavailable_backend(monkeypatch)
+    backend.connect()
+    backend.publish_perception(payload())
+    backend.publish_controller(ControllerState())
+    backend.flush()
+    backend.close()  # also a no-op; must not raise
+
+
+def test_reads_return_none_when_nt_is_unavailable(monkeypatch):
+    """No odometry and no alliance -- handled upstream as UNKNOWN/invalid."""
+    backend = unavailable_backend(monkeypatch)
+    backend.connect()
+    assert backend.read_odometry() is None
+    assert backend.read_is_red_alliance() is None
+    assert backend.poll_connection() is False
+
+
+def test_the_unavailable_warning_is_logged_once_not_every_cycle(monkeypatch, caplog):
+    import frc_perception.nt_io as module
+
+    monkeypatch.setattr(module, "NT_AVAILABLE", False)
+    monkeypatch.setattr(module, "NT_IMPORT_ERROR", "ModuleNotFoundError: no ntcore")
+    monkeypatch.setattr(module, "_WARNED_UNAVAILABLE", False)
+
+    with caplog.at_level("WARNING"):
+        module.warn_nt_unavailable()
+        module.warn_nt_unavailable()
+        module.warn_nt_unavailable()
+
+    emitted = [r for r in caplog.records if "NETWORKTABLES DISABLED" in r.message]
+    assert len(emitted) == 1
+    # The message must tell the reader the pipeline continues and how to fix it.
+    assert "continues to run" in emitted[0].message
+    assert "pyntcore" in emitted[0].message
+
+
+def test_live_requires_both_the_import_and_a_started_client(monkeypatch):
+    """A guard that only checked _instance would be fooled by a stale object."""
+    import frc_perception.nt_io as module
+
+    backend = unavailable_backend(monkeypatch)
+    backend._instance = object()  # pretend a client object survived
+    assert backend._live is False, "NT_AVAILABLE False must still mean not live"
+
+    monkeypatch.setattr(module, "NT_AVAILABLE", True)
+    assert backend._live is True
+    backend._instance = None
+    assert backend._live is False

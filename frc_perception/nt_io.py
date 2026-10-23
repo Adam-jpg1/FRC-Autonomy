@@ -38,6 +38,75 @@ from .types import ControllerState
 logger = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# NetworkTables availability  (ntcore is OPTIONAL)
+# ===========================================================================
+#
+# WHY THIS IS OPTIONAL
+#   On JetPack 6.2 / Python 3.10, robotpy currently ships no cp310 wheel for
+#   `pyntcore`, and building from source fails on robotpy-wpiutil. Blocking
+#   the whole perception pipeline on that would be wrong: cameras,
+#   detection, ranging, AprilTags, localization, the world model and
+#   navigation have nothing to do with NetworkTables.
+#
+#   So when ntcore is missing, NT degrades to a NO-OP. Everything upstream
+#   still runs and still logs; nothing is transmitted and nothing is read.
+#   The consequence to be aware of: with no NT there is no roboRIO
+#   odometry, so the pose cannot become valid and navigation correctly
+#   suppresses translation. Use `run.py --sim-nt` to exercise the full
+#   chain with simulated odometry.
+#
+# TO RE-ENABLE LATER
+#   Once robotpy has a wheel for your Python version:
+#       pip install pyntcore
+#       python3 -c "import ntcore; print(ntcore.__file__)"
+#   Nothing in this file needs editing. NT_AVAILABLE flips to True by
+#   itself and every guard below becomes a pass-through.
+#
+# The import is wrapped rather than deferred so the flag is a single,
+# inspectable fact instead of a side effect of a failed call.
+try:
+    import ntcore  # type: ignore[import-not-found]
+
+    NT_AVAILABLE = True
+    NT_IMPORT_ERROR = ""
+except Exception as _nt_import_exc:  # noqa: BLE001 - a half-built native wheel
+    # can raise ImportError, OSError, or something from the .so loader.
+    ntcore = None  # type: ignore[assignment]
+    NT_AVAILABLE = False
+    NT_IMPORT_ERROR = f"{type(_nt_import_exc).__name__}: {_nt_import_exc}"
+
+#: Set once the "NT is disabled" warning has been emitted, so a process
+#: that builds several backends still logs it exactly once.
+_WARNED_UNAVAILABLE = False
+
+
+def nt_status() -> str:
+    """One-line description of NetworkTables availability, for diagnostics."""
+    if NT_AVAILABLE:
+        return "ntcore available"
+    return f"ntcore UNAVAILABLE ({NT_IMPORT_ERROR}); NetworkTables disabled"
+
+
+def warn_nt_unavailable() -> None:
+    """Log the single clear warning explaining the degraded mode."""
+    global _WARNED_UNAVAILABLE
+    if _WARNED_UNAVAILABLE:
+        return
+    _WARNED_UNAVAILABLE = True
+    logger.warning(
+        "NETWORKTABLES DISABLED: %s. The perception pipeline continues to run "
+        "(cameras, detection, ranging, AprilTags, localization, world model, "
+        "navigation) but NOTHING is published to or read from the roboRIO. "
+        "With no odometry the pose stays INVALID and navigation suppresses "
+        "translation, which is the safe behavior. Re-enable with "
+        "`pip install pyntcore` once robotpy has a wheel for this Python; no "
+        "code change is needed. For a full-chain test without a roboRIO use "
+        "`python run.py --sim-nt`.",
+        NT_IMPORT_ERROR or "ntcore not importable",
+    )
+
+
 class NTBackend:
     """Interface implemented by the real client and by the simulator."""
 
@@ -218,8 +287,23 @@ class NetworkTablesIO(NTBackend):
     # -- lifecycle ---------------------------------------------------------
 
     @property
+    def _live(self) -> bool:
+        """True only when ntcore imported AND the client actually started.
+
+        Every read and write below is guarded on this, so "NT missing"
+        produces no-ops by INTENT rather than as a side effect of some
+        other attribute happening to be None.
+        """
+        return NT_AVAILABLE and self._instance is not None
+
+    @property
+    def available(self) -> bool:
+        """Whether NetworkTables support is compiled in at all."""
+        return NT_AVAILABLE
+
+    @property
     def connected(self) -> bool:
-        if self._instance is None:
+        if not self._live:
             return False
         try:
             return bool(self._instance.isConnected())
@@ -233,11 +317,11 @@ class NetworkTablesIO(NTBackend):
         the application simply keeps publishing and the values land once
         the link comes back.
         """
-        try:
-            import ntcore
-        except ImportError as exc:
-            self.load_error = f"ntcore not installed: {exc}"
-            logger.error("networktables: %s", self.load_error)
+        if not NT_AVAILABLE:
+            # No ntcore: stay un-started. Every method below is guarded on
+            # self._live, so the whole backend becomes a no-op.
+            self.load_error = nt_status()
+            warn_nt_unavailable()
             return
 
         try:
@@ -268,7 +352,7 @@ class NetworkTablesIO(NTBackend):
             self._instance = None
 
     def close(self) -> None:
-        if self._instance is None:
+        if not self._live:  # NT disabled: nothing was ever opened
             return
         try:
             for publisher in self._publishers.values():
@@ -285,6 +369,8 @@ class NetworkTablesIO(NTBackend):
 
     def poll_connection(self) -> bool:
         """Log connect/disconnect transitions.  Returns the current state."""
+        if not NT_AVAILABLE:
+            return False  # NT disabled: no link to report transitions for
         state = self.connected
         if state != self._last_connected:
             if state:
@@ -297,6 +383,8 @@ class NetworkTablesIO(NTBackend):
     # -- reads -------------------------------------------------------------
 
     def read_is_red_alliance(self) -> Optional[bool]:
+        if not self._live:
+            return None  # NT disabled: alliance is UNKNOWN, handled upstream
         subscriber = self._subscribers.get("is_red")
         if subscriber is None:
             return None
@@ -320,6 +408,8 @@ class NetworkTablesIO(NTBackend):
         return value
 
     def read_odometry(self) -> Optional[Tuple[float, float, float, float]]:
+        if not self._live:
+            return None  # NT disabled: no odometry, so the pose stays invalid
         try:
             values = [
                 float(self._subscribers[key].get())
@@ -357,8 +447,8 @@ class NetworkTablesIO(NTBackend):
         return publisher
 
     def _publish_dict(self, table: Any, payload: Dict[str, Any]) -> None:
-        if table is None:
-            return
+        if not self._live or table is None:
+            return  # NT disabled: publishing is a no-op
         for key, value in payload.items():
             try:
                 publisher = self._publisher(table, key, value)
@@ -370,13 +460,17 @@ class NetworkTablesIO(NTBackend):
                 logger.debug("networktables: publish of %r failed: %s", key, exc)
 
     def publish_perception(self, payload: Dict[str, Any]) -> None:
+        if not self._live:
+            return  # NT disabled: no-op
         self._publish_dict(self._perception_table, payload)
 
     def publish_controller(self, state: ControllerState) -> None:
+        if not self._live:
+            return  # NT disabled: no-op
         self._publish_dict(self._controller_table, state.as_dict())
 
     def flush(self) -> None:
-        if self._instance is not None:
+        if self._live:
             try:
                 self._instance.flush()
             except Exception:  # noqa: BLE001
@@ -452,9 +546,13 @@ def missing_required_keys(payload: Dict[str, Any]) -> List[str]:
 
 __all__ = [
     "NTBackend",
+    "NT_AVAILABLE",
+    "NT_IMPORT_ERROR",
     "NetworkTablesIO",
     "REQUIRED_PERCEPTION_KEYS",
     "SimulatedNT",
     "build_perception_payload",
     "missing_required_keys",
+    "nt_status",
+    "warn_nt_unavailable",
 ]

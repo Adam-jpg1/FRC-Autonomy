@@ -122,6 +122,37 @@ wherever JetPack put them), **not** inside `.venv`. If either moved into
 pip uninstall -y numpy opencv-python opencv-python-headless
 ```
 
+### NetworkTables (`pyntcore`) is OPTIONAL — **[NOW]**
+
+On JetPack 6.2 / Python 3.10 robotpy currently ships no cp310 wheel for
+`pyntcore`, and building from source fails on robotpy-wpiutil. **Do not
+fight it.** NetworkTables is optional: with `ntcore` missing the whole
+pipeline still runs and logs one clear warning.
+
+```bash
+python3 -c "from frc_perception.nt_io import nt_status; print(nt_status())"
+python3 run.py --check --no-camera-probe 2>&1 | grep networktables.available
+```
+
+What degrades, and only this: nothing is published to or read from the
+roboRIO. Because there is then no odometry, the pose stays **INVALID** and
+navigation suppresses translation — the safe behavior, not a bug. For a
+full-chain test with a valid pose, use simulated odometry:
+
+```bash
+python3 run.py --sim-nt
+```
+
+To re-enable later, once robotpy has a wheel for your Python:
+
+```bash
+pip install pyntcore
+python3 -c "import ntcore; print(ntcore.__file__)"
+```
+
+No code change is needed — `NT_AVAILABLE` in `frc_perception/nt_io.py`
+flips to True on its own and every guard becomes a pass-through.
+
 > **Do not run `pip install -r requirements.txt` on the Jetson** until
 > torch is settled (section 8). `requirements.txt` is for the full stack
 > and lists `ultralytics`, which drags in a CPU torch. README §5 covers
@@ -721,6 +752,8 @@ python3 test_decisions.py --json examples/decision_tests.json
 python3 test_decisions.py --interactive
 python3 test_decisions.py --help-expect
 python3 run.py --sim-nt
+python3 run.py                                      # real NT backend; runs fine without ntcore
+python3 -c "from frc_perception.nt_io import nt_status; print(nt_status())"
 
 # --- [NEEDS pytest] ------------------------------------------------------
 pytest                                      # 326 passed (325 + 1 skip without cv2)

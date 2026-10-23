@@ -443,3 +443,65 @@ def test_the_original_capture_timestamp_survives_the_whole_pipeline(tmp_path):
     assert observations, "the detection should have ranged successfully"
     assert observations[0].timestamp == pytest.approx(capture_time)
     assert observations[0].camera_id == "cam0"
+
+
+# ---------------------------------------------------------------------------
+# The main loop runs with NetworkTables absent
+# ---------------------------------------------------------------------------
+
+
+def test_the_loop_runs_with_the_real_nt_backend_and_no_ntcore(monkeypatch):
+    """run.py's default path: the REAL NetworkTablesIO with ntcore missing.
+
+    Pins the whole reason NT is optional -- the loop must iterate, the
+    detector/pose/world-model stages must all execute, and nothing may
+    raise. Uses the real backend, not SimulatedNT.
+    """
+    from frc_perception.config import NetworkTablesConfig
+    import frc_perception.nt_io as nt_module
+    from frc_perception.nt_io import NetworkTablesIO
+
+    monkeypatch.setattr(nt_module, "NT_AVAILABLE", False)
+    monkeypatch.setattr(nt_module, "NT_IMPORT_ERROR", "ModuleNotFoundError: no ntcore")
+
+    cfg = headless_config()
+    cfg.networktables = NetworkTablesConfig(team_number=1234)
+    app = PerceptionApp(cfg, nt=NetworkTablesIO(cfg.networktables))
+
+    app.start()
+    try:
+        for index in range(5):
+            app.step(now=1.0 + index * 0.033)
+    finally:
+        app.stop()
+
+    assert app.stats.frame_counter == 5
+    # No stage may report a failure: NT being absent is a degraded mode, not
+    # an error path.
+    assert {k: v for k, v in app._stage_failures.items() if v} == {}
+
+
+def test_without_networktables_the_pose_is_invalid_and_nothing_translates(monkeypatch):
+    """No NT means no odometry, so the safe behavior must hold."""
+    from frc_perception.config import NetworkTablesConfig
+    import frc_perception.nt_io as nt_module
+    from frc_perception.nt_io import NetworkTablesIO
+
+    monkeypatch.setattr(nt_module, "NT_AVAILABLE", False)
+    monkeypatch.setattr(nt_module, "NT_IMPORT_ERROR", "ModuleNotFoundError: no ntcore")
+
+    cfg = headless_config()
+    cfg.networktables = NetworkTablesConfig(team_number=1234)
+    app = PerceptionApp(cfg, nt=NetworkTablesIO(cfg.networktables))
+
+    app.start()
+    try:
+        app.step(now=1.0)
+        estimate = app.estimator.last_estimate
+        motion = app.navigator.plan(estimate, [], [], 1.0)
+    finally:
+        app.stop()
+
+    assert estimate.valid is False
+    assert motion.vx_mps == 0.0 and motion.vy_mps == 0.0
+    assert app.world.all_tracks == []
